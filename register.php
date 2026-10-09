@@ -102,7 +102,8 @@ include 'includes/header.php';
 ?>
 
 <!-- intl-tel-input Library -->
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/intl-tel-input@24.6.0/build/css/intlTelInput.cs<style>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/intl-tel-input@24.6.0/build/css/intlTelInput.css">
+<style>
     body { background-color: #f8fafc; }
     .register-card { border-radius: 20px; overflow: hidden; box-shadow: 0 20px 40px rgba(15, 23, 42, 0.08); border: 1px solid #e2e8f0; background-color: #fff; }
     .register-sidebar { background: linear-gradient(145deg, #0F1E36 0%, #1e3a8a 55%, #1e40af 100%); position: relative; color: white; }

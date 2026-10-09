@@ -77,9 +77,9 @@ services:
     ports:
       - "3306:3306"
     environment:
-      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-change_me}
-      - WORKSPACE_DB_PASSWORD=${WORKSPACE_DB_PASSWORD:-change_me}
-      - VMSPORTAL_DB_PASSWORD=${VMSPORTAL_DB_PASSWORD:-change_me}
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-Xcel007!}
+      - WORKSPACE_DB_PASSWORD=${WORKSPACE_DB_PASSWORD:-Xcel007!}
+      - VMSPORTAL_DB_PASSWORD=${VMSPORTAL_DB_PASSWORD:-Xcel007!}
     volumes:
       - db_data:/var/lib/mysql
       - ./db_migrations:/docker-entrypoint-initdb.d
