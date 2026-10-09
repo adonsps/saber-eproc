@@ -1,0 +1,81 @@
+flowchart TD
+    %% Define Global Styles
+    classDef dev fill:#e3f2fd,stroke:#1e88e5,stroke-width:2px,color:#000,rx:10,ry:10;
+    classDef cicd fill:#ede7f6,stroke:#5e35b1,stroke-width:2px,color:#000,rx:10,ry:10;
+    classDef vps fill:#fbe9e7,stroke:#ff5722,stroke-width:2px,color:#000,rx:10,ry:10;
+    classDef docker fill:#e0f7fa,stroke:#00acc1,stroke-width:2px,color:#000,rx:10,ry:10;
+    classDef app fill:#e8f5e9,stroke:#43a047,stroke-width:2px,color:#000,rx:10,ry:10;
+    classDef db fill:#fff3e0,stroke:#fb8c00,stroke-width:2px,color:#000,rx:10,ry:10;
+    classDef ext fill:#fce4ec,stroke:#d81b60,stroke-width:2px,color:#000,rx:10,ry:10;
+    classDef user fill:#fffde7,stroke:#fbc02d,stroke-width:2px,color:#000,rx:15,ry:15;
+
+    %% Developers & CI/CD
+    subgraph DevEnv ["Development Environment"]
+        direction LR
+        Dev["Development Team\n(Using PHP, Python, SQL, JS)"]:::dev
+        Claude["Claude Code\nAI Assistant"]:::dev
+        Dev <-->|AI Code Generation| Claude
+    end
+
+    Github["GitHub Actions\nCI/CD Pipeline"]:::cicd
+    
+    DevEnv -->|Automated Push| Github
+
+    %% Hosting Environment
+    subgraph Hosting ["Hosting Environment"]
+        VPS["Ubuntu Linux VPS\n(IP: 187.77.112.238)"]:::vps
+        
+        NPM["Nginx Proxy Manager\nRouting & SSL Security"]:::vps
+        
+        subgraph Docker ["Docker Container Environment"]
+            AppContainer["App Container\nPHP/Apache Web Server"]:::docker
+            
+            subgraph App ["Corporate Procurement Digital Ecosystem"]
+                VSS["Vendor Sourcing System (VSS)\nExternal Vendor Portal"]:::app
+                Workspace["Workspace\nInternal Operations Portal"]:::app
+            end
+            
+            DBContainer["MySQL 8.0\nDatabase System"]:::db
+            PMA["phpMyAdmin\nDatabase Admin"]:::db
+            
+            VolUploads[("Secure File Storage\n(Persisted Volume)")]:::db
+            VolDB[("Database Storage\n(Persisted Volume)")]:::db
+        end
+    end
+    
+    Github -->|SSH Deploy| VPS
+    
+    %% Users
+    Vendors(["Vendors / Suppliers"]):::user
+    IntUsers(["Internal Users\n(Managers, Buyers)"]):::user
+    
+    Vendors -->|Secure Web Access| NPM
+    IntUsers -->|Secure Web Access| NPM
+    
+    NPM -->|Traffic Routing| AppContainer
+    NPM -->|Admin Access| PMA
+    
+    AppContainer -.- VSS
+    AppContainer -.- Workspace
+    
+    VSS <-->|Data Read/Write| DBContainer
+    Workspace <-->|Data Read/Write| DBContainer
+    PMA <-->|Admin Read/Write| DBContainer
+    
+    VSS <--> VolUploads
+    Workspace <--> VolUploads
+    DBContainer <--> VolDB
+    
+    %% External Services
+    subgraph External ["External Third-Party Services"]
+        Gemini["Google Gemini AI\nSmart Automation & Extraction"]:::ext
+        WA["Fonnte WhatsApp API\nInstant Notifications"]:::ext
+        Email["SMTP Mail Server\nEmail Alerts"]:::ext
+    end
+    
+    Workspace -->|Auto-assign PRs & Data| Gemini
+    VSS -->|Extract Docs & Profile Summary| Gemini
+    
+    Workspace -->|Broadcasts & Reminders| WA
+    Workspace -->|Email Alerts| Email
+    VSS -->|OTP & Status Alerts| WA

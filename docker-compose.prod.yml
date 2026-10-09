@@ -1,0 +1,211 @@
+# docker-compose.prod.yml for VSS and Workspace Pro (Standard Docker Setup)
+version: '3.8'
+
+services:
+  vms_prod_app:
+    build: .
+    # Nginx Proxy Manager will route traffic to port 80 of this container
+    # via the shared 'npm_network'
+    depends_on:
+      - db
+    volumes:
+      # We only mount the uploads folder so user files persist across deployments
+      - app_uploads:/var/www/html/uploads
+      # K2 Drive automation private state. The HTTP endpoints stage uploaded
+      # AON/PR workbooks here and the CLI worker picks them up on a later cron
+      # tick — a different process, and after a redeploy possibly a different
+      # container — so this MUST be a persistent volume, not container-local
+      # disk. Without it every in-flight staged batch is destroyed by the next
+      # `up -d --build`. Ownership is seeded from the image (see Dockerfile) so
+      # Apache's www-data can write here.
+      - k2_private:/var/k2_automation
+      # Nightly VSS backup receiver storage (backups/receive_backup.php).
+      # Off /var/www on purpose, same reasoning as k2_private above — must
+      # survive `up -d --build` redeploys, not live in the rebuilt image.
+      - vss_backups:/var/vss_backups
+    environment:
+      - DB_HOST=db
+      - DB_USER=${DB_USER:-u894129685_adonisvm}
+      - DB_PASS=${DB_PASS:-Xcel007!}
+      - DB_NAME=${DB_NAME:-u894129685_vmsportal}
+      # --- K2 Drive automation -------------------------------------------
+      # Delivered through the container environment (not the shared-hosting
+      # /var/k2-private-config/load-k2-env.php loader) because only the HTTP
+      # endpoints ever consult that loader: workspace/cron/process_k2_import_queue.php
+      # and workspace/automation/check_k2_automation_readiness.php read config
+      # exclusively via getenv(). Putting the values here is the only delivery
+      # method that reaches all three consumers with one identical environment.
+      # The bootstrap loader is deliberately left in place — it is a no-op when
+      # the file is absent, so it stays a harmless shared-hosting fallback.
+      #
+      # Deployment-specific — no default on purpose. Supply these from the host
+      # environment or the untracked .env file beside this compose file; the
+      # container fails its readiness check loudly if they are blank.
+      - K2_AUTOMATION_CLIENT_ID=${K2_AUTOMATION_CLIENT_ID}
+      - K2_AUTOMATION_HMAC_SECRET=${K2_AUTOMATION_HMAC_SECRET}
+      - K2_AUTOMATION_PUBLIC_API_BASE_PATH=${K2_AUTOMATION_PUBLIC_API_BASE_PATH}
+      # Private paths. The code's built-in default storage root is a sibling of
+      # the checkout — under Docker that resolves to /var/www/k2_automation_storage,
+      # which K2AutomationFileStorageConfig REJECTS because "www" is a forbidden
+      # public-web segment. So an explicit root is mandatory in this deployment,
+      # and it must stay off /var/www entirely. Both live on the k2_private volume.
+      - K2_AUTOMATION_STORAGE_ROOT=${K2_AUTOMATION_STORAGE_ROOT:-/var/k2_automation/storage}
+      - K2_AUTOMATION_DIAGNOSTIC_LOG_PATH=${K2_AUTOMATION_DIAGNOSTIC_LOG_PATH:-/var/k2_automation/logs/k2_automation.jsonl}
+      # Non-secret tuning. Defaults mirror the documented values in
+      # db_backups/k2_drive_automation_migration_readme.md; override per host.
+      - K2_AUTOMATION_MAX_UPLOAD_BYTES=${K2_AUTOMATION_MAX_UPLOAD_BYTES:-67108864}
+      - K2_AUTOMATION_ALLOWED_CLOCK_SKEW_SECONDS=${K2_AUTOMATION_ALLOWED_CLOCK_SKEW_SECONDS:-300}
+      - K2_AUTOMATION_LOCK_SECONDS=${K2_AUTOMATION_LOCK_SECONDS:-900}
+      - K2_AUTOMATION_STALE_OPERATION_SECONDS=${K2_AUTOMATION_STALE_OPERATION_SECONDS:-1800}
+      - K2_AUTOMATION_WORKER_LEASE_SECONDS=${K2_AUTOMATION_WORKER_LEASE_SECONDS:-1800}
+      - K2_AUTOMATION_WORKER_LOCK_SECONDS=${K2_AUTOMATION_WORKER_LOCK_SECONDS:-1800}
+      - K2_AUTOMATION_STAGED_RETENTION_SECONDS=${K2_AUTOMATION_STAGED_RETENTION_SECONDS:-86400}
+      - K2_AUTOMATION_FAILED_RETENTION_SECONDS=${K2_AUTOMATION_FAILED_RETENTION_SECONDS:-259200}
+      - K2_AUTOMATION_IMPORTED_BY=${K2_AUTOMATION_IMPORTED_BY:-k2_automation}
+      # AON write guard. 0.10 means "refuse any AON import that would soft-delete
+      # more than 10% of active SKUs" — deliberately conservative, because this is
+      # the blast-radius limit on a destructive catalog operation. Raise it only
+      # with a reviewed reason.
+      - K2_AON_MAX_REMOVAL_RATIO=${K2_AON_MAX_REMOVAL_RATIO:-0.10}
+      - K2_AON_GLOBAL_LOCK_TIMEOUT_SECONDS=${K2_AON_GLOBAL_LOCK_TIMEOUT_SECONDS:-30}
+      # --- Nightly VSS backup receiver (backups/receive_backup.php) ------
+      # This flag is the endpoint's first gate: only set true here, on the
+      # VPS container, so the same repo checked out on Hostinger (which has
+      # no docker-compose environment at all) always 404s instead of
+      # exposing a write endpoint there. Second gate is the shared secret
+      # below, which must match VSS_BACKUP_RECEIVER_SECRET in the sender's
+      # (Hostinger) environment. No default on purpose — see K2 vars above
+      # for the same pattern.
+      - VSS_BACKUP_RECEIVER_ENABLED=true
+      - VSS_BACKUP_RECEIVER_SECRET=${VSS_BACKUP_RECEIVER_SECRET}
+      - VSS_BACKUP_STORAGE_ROOT=${VSS_BACKUP_STORAGE_ROOT:-/var/vss_backups/storage}
+      # --- Vendor Evaluation v2 WhatsApp reminders (Fonnte) --------------
+      # The VE2 reminder WhatsApp sender (workspace/includes/vendor_eval_v2_fonnte.php)
+      # reads this via getenv('VE2_FONNTE_TOKEN') and FAILS CLOSED when it is
+      # blank — it never falls back to the shared FONNTE_TOKEN. Historically this
+      # token lived ONLY in the untracked workspace/config/vendor_eval_fonnte.local.php,
+      # which a git-based deploy does NOT carry, so on a fresh VPS every WA send
+      # failed (email was unaffected). Deliver it through the container
+      # environment instead. Secret — no default on purpose; supply it from the
+      # untracked .env beside this file. Same pattern as the K2 / VSS vars above.
+      - VE2_FONNTE_TOKEN=${VE2_FONNTE_TOKEN}
+      # --- Gemini AI — per-feature keys ------------------------------------
+      # Each used to share one hardcoded key (workspace/config/gemini_api.php
+      # / modules/vendor/*.php literals). Now one env var per feature group —
+      # see .env.example for the file-to-var mapping. Deliberately no default:
+      # a feature whose var is blank throws/returns "not configured" the
+      # first time it's used rather than silently reusing another feature's
+      # traffic quota or a leaked key. Supply real values (10 NEW keys
+      # generated in Google AI Studio / Cloud Console — a manual, human step)
+      # in the VPS's untracked .env BEFORE this deploy lands — see rollout
+      # sequencing notes in the AI-key migration plan.
+      - AI_PO_TAXONOMY_API_KEY=${AI_PO_TAXONOMY_API_KEY}
+      - AI_TICKET_ASSIGN_API_KEY=${AI_TICKET_ASSIGN_API_KEY}
+      - AI_SKU_API_KEY=${AI_SKU_API_KEY}
+      - AI_VENDOR_SUGGEST_API_KEY=${AI_VENDOR_SUGGEST_API_KEY}
+      - AI_SLA_CHAT_API_KEY=${AI_SLA_CHAT_API_KEY}
+      - AI_ADMIN_MISC_API_KEY=${AI_ADMIN_MISC_API_KEY}
+      - AI_VENDOR_DOC_EXTRACT_API_KEY=${AI_VENDOR_DOC_EXTRACT_API_KEY}
+      - AI_VENDOR_PROJECT_VALIDATE_API_KEY=${AI_VENDOR_PROJECT_VALIDATE_API_KEY}
+      - AI_VENDOR_BIZ_SUGGEST_API_KEY=${AI_VENDOR_BIZ_SUGGEST_API_KEY}
+      - AI_VENDOR_PROFILE_SUMMARY_API_KEY=${AI_VENDOR_PROFILE_SUMMARY_API_KEY}
+      # --- VSS DB credential (get_vss_pdo()) -------------------------------
+      # Unlike the keys above, THIS one keeps a default matching today's
+      # existing hardcoded credential on purpose — this is a hygiene/rotation
+      # hook for an already-working connection, not a new secret gating a
+      # feature. Leaving it unset in the VPS .env changes nothing; set a real
+      # rotated value here only when actually rotating the VSS DB password.
+      - VSS_DB_NAME=${VSS_DB_NAME:-u894129685_vmsportal}
+      - VSS_DB_USER=${VSS_DB_USER:-u894129685_adonisvm}
+      - VSS_DB_PASSWORD=${VSS_DB_PASSWORD:-Xcel007!}
+      # --- Mail send-rate guardrail (includes/mail_rate_limiter.php) --------
+      # Caps combined recipient-slot volume (To+Cc+Bcc, matching how Hostinger's
+      # quota counts) across every sender that routes through
+      # mail_rate_limited_send(), in a rolling 5-min and 1-hour window, to stop
+      # a repeat of the "aktivitas gak wajar" spam block. Blank => code defaults
+      # (15 / 5 min, 60 / hour); raise only once real headroom against the
+      # current Hostinger account is confirmed.
+      # Shared SMTP mailbox (includes/mail_config.php) -- Google Workspace,
+      # replacing the Hostinger-restricted corporateprocurement@vssportal.online.
+      # Password (a Google App Password) comes from the untracked .env beside
+      # this file. SMTP_FROM_EMAIL blank => the From follows SMTP_USERNAME.
+      - SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+      - SMTP_PORT=${SMTP_PORT:-465}
+      - SMTP_USERNAME=${SMTP_USERNAME:-sigit.ramadan@kawanlamacorp.com}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - SMTP_FROM_EMAIL=${SMTP_FROM_EMAIL:-}
+      - SMTP_FROM_NAME=${SMTP_FROM_NAME:-Saber eProc}
+      - MAIL_RATE_LIMIT_BURST=${MAIL_RATE_LIMIT_BURST:-}
+      - MAIL_RATE_LIMIT_HOURLY=${MAIL_RATE_LIMIT_HOURLY:-}
+      # Reminder Vendor Migrasi bulk send: OFF unless set to 1 (includes/migrated_reminder_helper.php).
+      - MIGRATED_REMINDER_SEND_ENABLED=${MIGRATED_REMINDER_SEND_ENABLED:-0}
+      - MIGRATED_REMINDER_DAILY_CAP=${MIGRATED_REMINDER_DAILY_CAP:-}
+    networks:
+      - default
+      - npm_network
+
+  webdav:
+    image: bytemark/webdav
+    restart: always
+    environment:
+      - AUTH_TYPE=Basic
+      - USERNAME=vssworkspaceadmin
+      # Read from the untracked .env (WEBDAV_PASSWORD). It used to be a literal in this
+      # tracked file, so it could not be rotated without committing the new value.
+      # No default on purpose: compose refuses to start rather than fall back.
+      - PASSWORD=${WEBDAV_PASSWORD:?set WEBDAV_PASSWORD in /var/www/vms/.env}
+    volumes:
+      - app_uploads:/var/lib/dav/data
+    networks:
+      - npm_network
+
+  db:
+    image: mysql:8.0
+    # sql-mode pinned to a MariaDB-compatible set (this app ran on MariaDB before the
+    # Aug-2026 VPS migration). MySQL 8.0's stricter defaults (NO_ZERO_DATE,
+    # NO_ZERO_IN_DATE, ONLY_FULL_GROUP_BY) reject zero-dates and non-full-group-by
+    # queries the app has always relied on -- e.g. the K2 AON import writes
+    # validity_to='0000-00-00', which errors under the default mode. STRICT_TRANS_TABLES
+    # is kept so silent data truncation still errors. Do NOT drop this line or the
+    # zero-date failures come back on the next db recreate.
+    command: --default-authentication-plugin=mysql_native_password --sql-mode=STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+    restart: always
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-secret}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-u894129685_vmsportal}
+      - MYSQL_USER=${DB_USER:-u894129685_adonisvm}
+      - MYSQL_PASSWORD=${DB_PASS:-Xcel007!}
+    volumes:
+      - db_data:/var/lib/mysql
+    # DB is only on the default network, isolated from NPM directly
+    networks:
+      - default
+
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    restart: always
+    depends_on:
+      - db
+    environment:
+      - PMA_HOST=db
+      - PMA_USER=${DB_USER:-u894129685_adonisvm}
+      - PMA_PASSWORD=${DB_PASS:-Xcel007!}
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-secret}
+    networks:
+      - default
+      - npm_network
+
+volumes:
+  db_data:
+    name: workspace_db_data_prod
+  app_uploads:
+    name: workspace_uploads_prod
+  k2_private:
+    name: workspace_k2_private_prod
+  vss_backups:
+    name: workspace_vss_backups_prod
+
+networks:
+  npm_network:
+    external: true
+    name: npm_network

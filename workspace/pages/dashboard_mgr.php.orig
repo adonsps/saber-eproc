@@ -1,0 +1,2359 @@
+<?php
+// pages/dashboard_mgr.php
+require_once '../includes/auth.php';
+require_manager();
+require_once '../config/database.php';
+// Vendor Evaluation v2 sender library — pulled in for ve2_csrf_token() only.
+// It is a pure function library: no DB, no WA, no email on include.
+require_once '../includes/vendor_eval_v2_sender.php';
+
+// --- PHASE D-1: PROJECT PGROUP EXCLUSION ------------------------------------
+// Mapped active Project PGroups belong to the Project Head dashboard
+// (dashboard_project_head.php), not this Non-Project Manager dashboard. We
+// exclude every PR whose p_group is an ACTIVE row in project_pgroups from the
+// assignable/unassigned-PR queries, the workload chart, and the manual
+// reassignment handler below. Compatibility: if the project_pgroups table is
+// not deployed yet we fail OPEN (no exclusion, legacy behaviour, never fatal).
+$project_pgroups_available = false;
+try {
+    $pdo->query("SELECT 1 FROM project_pgroups LIMIT 1");
+    $project_pgroups_available = true;
+} catch (PDOException $e) {
+    $project_pgroups_available = false;
+}
+// Reusable SQL fragment appended to PR queries (PR table named/aliased `prs`).
+// Empty string when project_pgroups is unavailable so queries stay valid.
+$project_exclude_sql = $project_pgroups_available
+    ? " AND NOT EXISTS (SELECT 1 FROM project_pgroups pp WHERE pp.p_group = prs.p_group AND pp.status = 'ACTIVE')"
+    : "";
+
+// --- CANVASSING_STATUS COMPATIBILITY GUARD ----------------------------------
+// prs.canvassing_status may not exist on every environment (e.g. local dev DBs
+// created before this column shipped). Detect it with a read-only SHOW COLUMNS
+// check and swap in a harmless NULL alias when absent so every query below
+// keeps returning a canvassing_status key without ever touching the schema.
+$canvassing_status_available = false;
+try {
+    $canvassing_status_available = (bool)$pdo->query("SHOW COLUMNS FROM prs LIKE 'canvassing_status'")->fetch();
+} catch (PDOException $e) {
+    $canvassing_status_available = false;
+}
+$canvassing_status_select = $canvassing_status_available ? 'prs.canvassing_status' : 'NULL AS canvassing_status';
+
+$manager_username = $_SESSION['username'] ?? '';
+$role = $_SESSION['role'] ?? '';
+$full_access_allowlist = ['adonis.sutanto', 'teofilus.franky', 'hadi.risali'];
+
+// --- HANDLE MANUAL RE-ASSIGNMENT (LINE-LEVEL, AJAX-capable) -----------------
+// Manual reassignment targets the SPECIFIC ticket line items selected in the
+// UI, never the whole ticket. Only prs.ticket_line_item values that were
+// selected AND actually belong to the submitted ticket are updated, inside a
+// transaction. AI assignment (assigned_by_ai = 1) still owns the whole ticket
+// by majority vote -- this manual path always stamps assigned_by_ai = 0 and
+// touches only the chosen lines.
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['reassign_ticket_no'], $_POST['new_pic'])) {
+    // AJAX path (the normal one now): the dashboard submits the reassignment via
+    // fetch with X-Requested-With so we can answer with JSON and let the page
+    // update in place -- no reload, no lost filters/scroll. A non-AJAX POST (no
+    // JS) still falls back to a one-shot session flash + redirect.
+    $is_ajax = (isset($_SERVER['HTTP_X_REQUESTED_WITH'])
+        && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest');
+
+    // Single exit point for the reassignment outcome. Messages are safe/user-
+    // facing only -- never SQL, PDO internals, or secrets. Extra keys
+    // (ticket_no/lines/assigned_pic) drive the client-side in-place row update.
+    $send_reassign_response = function($ok, $message, array $extra = []) use ($is_ajax) {
+        if ($is_ajax) {
+            if (!headers_sent()) { header('Content-Type: application/json; charset=utf-8'); }
+            echo json_encode(array_merge([
+                'ok'      => (bool)$ok,
+                'type'    => $ok ? 'success' : 'error',
+                'message' => $message,
+            ], $extra));
+            exit;
+        }
+        $_SESSION['reassign_flash'] = ['type' => $ok ? 'success' : 'error', 'message' => $message];
+        header('Location: dashboard_mgr.php');
+        exit;
+    };
+
+    $new_pic = trim($_POST['new_pic']);
+    $ticket = trim((string)$_POST['reassign_ticket_no']);
+    $pic_val = ($new_pic === '') ? null : $new_pic;
+
+    // Selected line items (values are prs.ticket_line_item). Normalise to a
+    // unique, non-empty list. Empty => nothing to do; we intentionally do NOT
+    // fall back to a whole-ticket update.
+    $raw_lines = $_POST['reassign_lines'] ?? [];
+    if (!is_array($raw_lines)) { $raw_lines = [$raw_lines]; }
+    $sel_lines = [];
+    foreach ($raw_lines as $ln) {
+        $ln = trim((string)$ln);
+        if ($ln !== '') { $sel_lines[$ln] = true; }
+    }
+    $sel_lines = array_keys($sel_lines);
+
+    if ($ticket === '' || empty($sel_lines)) {
+        $send_reassign_response(false, 'Reassignment failed. No valid line items were selected for this ticket.');
+    }
+
+    // Never reassign a mapped active Project PGroup ticket through this
+    // Non-Project dashboard -- this also blocks hand-crafted POST requests.
+    $is_project_ticket = false;
+    if ($project_pgroups_available) {
+        $chk = $pdo->prepare("SELECT 1 FROM prs JOIN project_pgroups pp ON pp.p_group = prs.p_group AND pp.status = 'ACTIVE' WHERE prs.ticket_no = ? LIMIT 1");
+        $chk->execute([$ticket]);
+        $is_project_ticket = (bool)$chk->fetchColumn();
+    }
+
+    $reassign_allowed = true;
+
+    // Outcome bookkeeping for the feedback response below. This does NOT alter
+    // the assignment/validation logic -- it only records what happened.
+    $reassign_result = null;   // 'success' | 'db_error' | 'no_valid_lines'
+    $updated_count   = 0;
+    $valid_lines     = [];    // the exact lines the DB write touched (echoed back on success)
+
+    if (!$is_project_ticket && $reassign_allowed) {
+        // Confirm the selected lines actually belong to this ticket before
+        // writing, so a hand-crafted POST can never move lines from another
+        // ticket. Only the intersection is updated; unselected lines of the
+        // ticket stay untouched.
+        $line_ph = implode(',', array_fill(0, count($sel_lines), '?'));
+        $vstmt = $pdo->prepare("SELECT ticket_line_item FROM prs WHERE ticket_no = ? AND ticket_line_item IN ($line_ph)");
+        $vstmt->execute(array_merge([$ticket], $sel_lines));
+        $valid_lines = $vstmt->fetchAll(PDO::FETCH_COLUMN);
+
+        if (!empty($valid_lines)) {
+            $upd_ph = implode(',', array_fill(0, count($valid_lines), '?'));
+            try {
+                $pdo->beginTransaction();
+                $updateStmt = $pdo->prepare("UPDATE prs SET assigned_pic = ?, assigned_by_ai = 0 WHERE ticket_no = ? AND ticket_line_item IN ($upd_ph)");
+                $updateStmt->execute(array_merge([$pic_val, $ticket], $valid_lines));
+                
+                // Update master data if requested
+                $update_master_data = isset($_POST['update_master_data']) && $_POST['update_master_data'] == '1';
+                if ($update_master_data && $role === 'Category Manager') {
+                    $md_stmt = $pdo->prepare("SELECT DISTINCT master_data_id FROM prs WHERE ticket_no = ? AND ticket_line_item IN ($upd_ph) AND master_data_id IS NOT NULL");
+                    $md_stmt->execute(array_merge([$ticket], $valid_lines));
+                    $md_ids = $md_stmt->fetchAll(PDO::FETCH_COLUMN);
+                    if (!empty($md_ids)) {
+                        $md_in = implode(',', array_fill(0, count($md_ids), '?'));
+                        $new_md_pic = $pic_val === null ? '' : $pic_val;
+                        $md_upd = $pdo->prepare("UPDATE master_data SET pic_names = ?, suggested_pic_names = NULL, suggested_by = NULL WHERE id IN ($md_in)");
+                        $md_upd->execute(array_merge([$new_md_pic], $md_ids));
+                    }
+                }
+                
+                $pdo->commit();
+                $reassign_result = 'success';
+                $updated_count   = count($valid_lines);
+            } catch (PDOException $e) {
+                if ($pdo->inTransaction()) { $pdo->rollBack(); }
+                $reassign_result = 'db_error';
+            }
+        } else {
+            $reassign_result = 'no_valid_lines';
+        }
+    }
+
+    // --- Feedback response (JSON for AJAX, else one-shot session flash) -----
+    // Messages are safe/user-facing only -- no SQL, no PDO internals, no
+    // secrets. $send_reassign_response() exits, so exactly one branch fires.
+    if (!$reassign_allowed) {
+        $send_reassign_response(false, "Reassignment failed. The selected PIC is not eligible for this ticket's team.");
+    } elseif ($is_project_ticket) {
+        $send_reassign_response(false, 'Reassignment failed. This ticket is managed on the Project dashboard.');
+    } elseif ($reassign_result === 'success') {
+        $success_message = ($pic_val === null)
+            ? ('Reassignment successful. ' . $updated_count . ' line item(s) from ticket ' . $ticket . ' were set to Unassigned.')
+            : ('Reassignment successful. ' . $updated_count . ' line item(s) from ticket ' . $ticket . ' were reassigned to ' . $pic_val . '.');
+        // Echo back the exact ticket + lines the DB write touched and the
+        // resulting PIC (null => Unassigned) so the client can update just
+        // those visible rows.
+        $send_reassign_response(true, $success_message, [
+            'ticket_no'    => $ticket,
+            'lines'        => array_map('strval', $valid_lines),
+            'assigned_pic' => $pic_val,
+        ]);
+    } elseif ($reassign_result === 'db_error') {
+        $send_reassign_response(false, 'Reassignment failed. A database error occurred while updating the selected lines. No changes were saved.');
+    } else {
+        // no_valid_lines: the submitted lines did not belong to this ticket.
+        $send_reassign_response(false, 'Reassignment failed. No valid line items were selected for this ticket.');
+    }
+}
+require_once '../includes/header.php';
+?>
+<link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet" />
+<script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
+<style>.select2-container { z-index: 1060 !important; } .select2-selection { font-size: 0.75rem; padding: 0.25rem; border-color: #d1d5db !important; }</style>
+<?php
+
+// One-shot reassignment feedback flash from the POST handler above -- read
+// once, then cleared so a browser refresh doesn't replay it. Rendered as a
+// modal below (non-AJAX fallback path only).
+$reassign_flash = $_SESSION['reassign_flash'] ?? null;
+unset($_SESSION['reassign_flash']);
+
+// --- FETCH DATA ---
+// One Workload Dashboard, three personas:
+//   COMBINED   = Full-access allowlist OR Category Manager: Non-Project rows + every active Project group.
+//   PROJECT    = Manager who heads at least one active Project group (Rio/Fabian):
+//                ONLY their Project group(s); no Non-Project rows.
+//   NONPROJECT = Manager with no Project group (Susi/Jimmy/Michelle):
+//                the original Non-Project behaviour, completely unchanged.
+// get_project_head_groups() fails closed to [] (e.g. project tables not deployed),
+// so a Non-Project manager always resolves to NONPROJECT and behaves as before.
+
+$project_groups = function_exists('get_project_head_groups')
+    ? get_project_head_groups($pdo, $_SESSION)
+    : [];
+if (in_array($manager_username, $full_access_allowlist) || $role === 'Category Manager') {
+    $persona = 'COMBINED';
+} elseif ($role === 'Manager' && !empty($project_groups)) {
+    $persona = 'PROJECT';
+} else {
+    $persona = 'NONPROJECT';
+}
+
+
+$all_prs     = [];   // unified display rows (each tagged with _row_type)
+$workload_np = [];   // Non-Project workload: assigned_pic => open-PR count
+$all_pics    = [];   // Non-Project assignable PIC pool (reassign modal + filter)
+
+// Non-Project team short codes (UI-only; mirrors the analytics acronym map in
+// cost_savings.php). Used to derive per-row team labels for the COMBINED team
+// filter from existing pgroup_team_mappings.team_name -- display only.
+$np_acronym_map = [
+    'Corporate Services, General Supplies & Marketing' => 'CSGSM',
+    'Technology, Industrial, and General Services'      => 'TIGS',
+    'FNB and Operational Merchandise'                   => 'FNBOM',
+    'Admin Team'                                        => 'ADMIN',
+    'Project Konstruksi Retail'                         => 'PKR',
+    'Project Konstruksi Properti'                       => 'PKP',
+    'Maintenance & Facility Management'                 => 'MFM',
+];
+$np_team_code = function($team_name) use ($np_acronym_map) {
+    $t = trim((string)$team_name);
+    if ($t === '') return '';
+    return $np_acronym_map[$t] ?? $t;
+};
+
+// ===== NON-PROJECT SOURCE (NONPROJECT + COMBINED) ==========================
+if ($persona === 'COMBINED') {
+    // Category Manager: every Non-Project PR (active Project PGroups excluded).
+    $stmt = $pdo->query("SELECT prs.ticket_no, prs.ticket_line_item, prs.master_data_id, prs.pr_date, prs.p_org, prs.requestor_name, prs.item_description, prs.status_ticket, prs.assigned_pic, prs.assigned_by_ai, prs.canvassing_no, {$canvassing_status_select}, prs.canvassing_date, prs.po_number, prs.po_amount, m.team_name, prs.ticket_type FROM prs LEFT JOIN pgroup_team_mappings m ON prs.p_group = m.p_group WHERE LOWER(prs.status_ticket) NOT LIKE '%cancel%' AND (prs.pr_date >= '2026-05-01' OR prs.pr_date IS NULL)" . $project_exclude_sql . " ORDER BY prs.created_at DESC");
+    $np_prs = $stmt->fetchAll();
+
+    $chartStmt = $pdo->query("SELECT assigned_pic, COUNT(*) as count FROM prs WHERE assigned_pic IS NOT NULL AND LOWER(status_ticket) NOT LIKE '%cancel%' AND (po_number IS NULL OR TRIM(po_number) = '') AND (pr_date >= '2026-05-01' OR pr_date IS NULL)" . $project_exclude_sql . " GROUP BY assigned_pic");
+    foreach ($chartStmt->fetchAll() as $row) { $workload_np[$row['assigned_pic']] = (int)$row['count']; }
+
+    $picStmt = $pdo->query("SELECT name FROM users WHERE role IN ('PIC', 'Admin') ORDER BY name ASC");
+    $all_pics = $picStmt->fetchAll(PDO::FETCH_COLUMN);
+
+    foreach ($np_prs as $r) { $r['_row_type'] = 'nonproject'; $r['np_team'] = $np_team_code($r['team_name'] ?? ''); $all_prs[] = $r; }
+} elseif ($persona === 'NONPROJECT') {
+    // For Manager role: Get all PICs managed by this manager recursively
+    $subordinates = get_all_subordinates($pdo, $manager_username);
+    foreach ($subordinates as $sub) {
+        if ($sub['role'] === 'PIC' || $sub['role'] === 'Admin') {
+            $all_pics[] = $sub['name'];
+        }
+    }
+    $all_pics = array_unique($all_pics);
+    sort($all_pics);
+
+    if (count($all_pics) > 0) {
+        // Get PRs assigned to any of this manager's PICs, or unassigned PRs, or intercompany tickets
+        $inQuery = implode(',', array_fill(0, count($all_pics), '?'));
+        $prStmt = $pdo->prepare("SELECT prs.ticket_no, prs.ticket_line_item, prs.master_data_id, prs.pr_date, prs.p_org, prs.requestor_name, prs.item_description, prs.status_ticket, prs.assigned_pic, prs.assigned_by_ai, prs.canvassing_no, {$canvassing_status_select}, prs.canvassing_date, prs.po_number, prs.po_amount, prs.ticket_type FROM prs LEFT JOIN pgroup_team_mappings m ON prs.p_group = m.p_group WHERE (prs.assigned_pic IN ($inQuery) OR prs.assigned_pic IS NULL OR LOWER(prs.ticket_type) IN ('intercompany', 'intercompany new store')) AND LOWER(prs.status_ticket) NOT LIKE '%cancel%' AND (prs.pr_date >= '2026-05-01' OR prs.pr_date IS NULL)" . $project_exclude_sql . " ORDER BY prs.created_at DESC");
+        $prStmt->execute($all_pics);
+        $np_prs = $prStmt->fetchAll();
+
+        $chartStmt = $pdo->prepare("SELECT assigned_pic, COUNT(*) as count FROM prs WHERE assigned_pic IN ($inQuery) AND LOWER(status_ticket) NOT LIKE '%cancel%' AND (po_number IS NULL OR TRIM(po_number) = '') AND (pr_date >= '2026-05-01' OR pr_date IS NULL)" . $project_exclude_sql . " GROUP BY assigned_pic");
+        $chartStmt->execute($all_pics);
+        foreach ($chartStmt->fetchAll() as $row) { $workload_np[$row['assigned_pic']] = (int)$row['count']; }
+    } else {
+        // Manager has no PICs: show all PRs
+        $prStmt = $pdo->query("SELECT prs.ticket_no, prs.ticket_line_item, prs.master_data_id, prs.pr_date, prs.p_org, prs.requestor_name, prs.item_description, prs.status_ticket, prs.assigned_pic, prs.assigned_by_ai, prs.canvassing_no, {$canvassing_status_select}, prs.canvassing_date, prs.po_number, prs.po_amount, prs.ticket_type FROM prs LEFT JOIN pgroup_team_mappings m ON prs.p_group = m.p_group WHERE LOWER(prs.status_ticket) NOT LIKE '%cancel%' AND (prs.pr_date >= '2026-05-01' OR prs.pr_date IS NULL)" . $project_exclude_sql . " ORDER BY prs.created_at DESC");
+        $np_prs = $prStmt->fetchAll();
+    }
+    foreach ($np_prs as $r) { $r['_row_type'] = 'nonproject'; $all_prs[] = $r; }
+}
+
+// ===== PROJECT SOURCE (PROJECT + COMBINED) =================================
+// Mirrors dashboard_project_head.php: NO AI. Effective officer = assigned_pic,
+// then parsed GP OFFICER resolved to an eligible officer, then source-backed
+// Ridwan Arifin, else Unassigned. Assignment is manual via ajax_project_assign.php
+// scoped to ticket_no + p_group; Intercompany rows stay read-only/system-routed.
+$project_workload   = [];   // effective officer => ticket+p_group unit count
+$officers_by_pgroup = [];   // p_group => [officer names]  (JS assign modal pool)
+$project_team_codes = [];   // group_number => 'PKR' | 'PKP' | 'MFM' | 'G#'
+if (($persona === 'PROJECT' || $persona === 'COMBINED') && $project_pgroups_available && !empty($project_groups)) {
+    // Short codes are UI-only; canonical full names come from the DB.
+    $team_short_codes = [1 => 'PKR', 2 => 'PKP', 3 => 'MFM'];
+    $team_code = function($n) use ($team_short_codes) {
+        return $team_short_codes[(int)$n] ?? ('G' . (int)$n);
+    };
+    foreach ($project_groups as $gn) { $project_team_codes[(int)$gn] = $team_code($gn); }
+
+    $group_ph = implode(',', array_fill(0, count($project_groups), '?'));
+
+    // Eligible officer pools + resolver (display hints + assign-modal options).
+    $officers_by_group_number = [];
+    $officer_resolver = [];
+    $ostmt = $pdo->prepare("SELECT p_group, project_group_number, officer_name, officer_nip
+                            FROM project_pgroup_officers
+                            WHERE active = 1 AND project_group_number IN ($group_ph)
+                            ORDER BY officer_name");
+    $ostmt->execute($project_groups);
+    foreach ($ostmt->fetchAll(PDO::FETCH_ASSOC) as $o) {
+        $pg = $o['p_group']; $gnum = (int)$o['project_group_number'];
+        $officers_by_pgroup[$pg][] = $o['officer_name'];
+        if (!isset($officers_by_group_number[$gnum]) || !in_array($o['officer_name'], $officers_by_group_number[$gnum], true)) {
+            $officers_by_group_number[$gnum][] = $o['officer_name'];
+        }
+        $officer_resolver[$pg]['names'][strtolower(trim((string)$o['officer_name']))] = $o['officer_name'];
+        $nip = trim((string)$o['officer_nip']);
+        if ($nip !== '') { $officer_resolver[$pg]['nips'][$nip] = $o['officer_name']; }
+    }
+
+    // Resolve a raw GP OFFICER string to an eligible officer for $p_group (display only).
+    $resolve_gp_officer = function($p_group, $gp_officer) use ($officer_resolver) {
+        $gp = trim((string)$gp_officer);
+        if ($gp === '' || !isset($officer_resolver[$p_group])) return null;
+        $map = $officer_resolver[$p_group];
+        $lc = strtolower($gp);
+        if (isset($map['names'][$lc])) return $map['names'][$lc];
+        if (preg_match('/^\d+/', $gp, $m) && isset($map['nips'][$m[0]])) return $map['nips'][$m[0]];
+        return null;
+    };
+    // Source-backed Ridwan Arifin exception (Admin, intentionally NOT an officer):
+    // counts toward workload only when the parsed GP OFFICER literally names him.
+    $ridwan_user_exists = (bool)$pdo
+        ->query("SELECT 1 FROM users WHERE username = 'ridwan.arifin' AND name = 'Ridwan Arifin' LIMIT 1")
+        ->fetchColumn();
+    $resolve_effective_officer = function($row) use ($resolve_gp_officer, $ridwan_user_exists) {
+        $pic = trim((string)($row['assigned_pic'] ?? ''));
+        if ($pic !== '') return $pic;
+        $resolved = $resolve_gp_officer($row['p_group'] ?? '', $row['gp_officer'] ?? '');
+        if ($resolved !== null) return $resolved;
+        if ($ridwan_user_exists && strtolower(trim((string)($row['gp_officer'] ?? ''))) === 'ridwan arifin') return 'Ridwan Arifin';
+        return null;
+    };
+
+    // Main project fetch, scoped to the persona's allowed groups.
+    $pstmt = $pdo->prepare("
+        SELECT prs.ticket_no, prs.ticket_line_item, prs.master_data_id, prs.pr_date, prs.p_org, prs.p_group, prs.requestor_name,
+               prs.item_description, prs.status_ticket, prs.canvassing_no, {$canvassing_status_select}, prs.canvassing_date,
+               prs.po_number, prs.po_amount, prs.ticket_type, prs.vendor_name, prs.assigned_pic, prs.assigned_by_ai,
+               prs.gp_officer, pp.project_group_number, pp.project_group_name
+        FROM prs
+        JOIN project_pgroups pp ON prs.p_group = pp.p_group AND pp.status = 'ACTIVE'
+        WHERE pp.project_group_number IN ($group_ph)
+          AND LOWER(prs.status_ticket) NOT LIKE '%cancel%'
+          AND (prs.pr_date >= '2026-05-01' OR prs.pr_date IS NULL)
+        ORDER BY prs.created_at DESC
+    ");
+    $pstmt->execute($project_groups);
+    $project_lines = $pstmt->fetchAll(PDO::FETCH_ASSOC);
+
+    $intercompany_types = ['intercompany', 'intercompany new store'];
+    foreach ($project_lines as &$pl) {
+        $pl['is_intercompany'] = in_array(strtolower(trim((string)$pl['ticket_type'])), $intercompany_types, true);
+    }
+    unset($pl);
+
+    // Aggregate to one visible row per ticket_no + p_group (assignment scope).
+    $grouped = [];
+    foreach ($project_lines as $line) {
+        $key = $line['ticket_no'] . '|' . $line['p_group'];
+        if (!isset($grouped[$key])) { $line['line_count'] = 1; $grouped[$key] = $line; continue; }
+        $g = &$grouped[$key];
+        $g['line_count']++;
+        if (trim((string)$g['assigned_pic']) === '' && trim((string)$line['assigned_pic']) !== '') {
+            $g['assigned_pic'] = $line['assigned_pic'];
+        }
+        if (trim((string)($g['gp_officer'] ?? '')) === '' && trim((string)($line['gp_officer'] ?? '')) !== '') {
+            $g['gp_officer'] = $line['gp_officer'];
+        }
+        if (!empty($line['is_intercompany'])) { $g['is_intercompany'] = true; }
+        unset($g);
+    }
+
+    foreach ($grouped as $g) {
+        $eff = $resolve_effective_officer($g);
+        if ($eff !== null) { $project_workload[$eff] = ($project_workload[$eff] ?? 0) + 1; }
+        $resolved_officer = (empty($g['is_intercompany']) && trim((string)$g['assigned_pic']) === '')
+            ? $resolve_gp_officer($g['p_group'], $g['gp_officer'] ?? '')
+            : null;
+        $all_prs[] = [
+            '_row_type'            => 'project',
+            'ticket_no'            => $g['ticket_no'],
+            'ticket_line_item'     => $g['ticket_line_item'] ?? '',
+            'master_data_id'       => $g['master_data_id'] ?? null,
+            'pr_date'              => $g['pr_date'],
+            'p_org'                => $g['p_org'],
+            'requestor_name'       => $g['requestor_name'],
+            'item_description'     => $g['item_description'],
+            'canvassing_no'        => $g['canvassing_no'],
+            'canvassing_status'    => $g['canvassing_status'],
+            'canvassing_date'      => $g['canvassing_date'],
+            'status_ticket'        => $g['status_ticket'],
+            'po_number'            => $g['po_number'],
+            'ticket_type'          => $g['ticket_type'],
+            'assigned_pic'         => $g['assigned_pic'],
+            'assigned_by_ai'       => $g['assigned_by_ai'],
+            'p_group'              => $g['p_group'],
+            'project_group_number' => (int)$g['project_group_number'],
+            'project_group_name'   => $g['project_group_name'],
+            'team_code'            => $team_code($g['project_group_number']),
+            'is_intercompany'      => !empty($g['is_intercompany']),
+            'line_count'           => $g['line_count'] ?? 1,
+            'effective_officer'    => $eff,
+            'resolved_officer'     => $resolved_officer,
+        ];
+    }
+
+    // PROJECT persona has no Non-Project source, so seed the Assigned-PIC filter
+    // dropdown from the eligible Project officer pool (COMBINED already lists all PICs).
+    if ($persona === 'PROJECT') {
+        $proj_officer_names = [];
+        foreach ($officers_by_group_number as $names) {
+            foreach ($names as $n) { $proj_officer_names[$n] = true; }
+        }
+        $all_pics = array_keys($proj_officer_names);
+        sort($all_pics);
+    }
+}
+
+// --- TEAM FILTER OPTIONS (persona-aware, UI-only) --------------------------
+// COMBINED: the full canonical Non-Project team structure + Project codes.
+// PROJECT:  only the manager's Project codes.
+// The filter row is hidden when a persona has a single available team (e.g.
+// Fabian = PKP only), so we never render a one-option filter.
+$np_team_codes = [];
+if ($persona === 'COMBINED') {
+    // Phase F-6: always render the canonical Non-Project teams (CSGSM / TIGS /
+    // FNBOM) for the Category Manager dashboard, even when a team has zero rows in
+    // the current dataset. Deriving the list from the rows alone dropped any team
+    // absent today (e.g. FNBOM). Filtering a zero-row team simply shows no rows
+    // (see the team-filter search handler). ADMIN is intentionally not a main team
+    // filter here. We are adding ADMIN now per user request.
+    $np_team_codes = ['CSGSM', 'TIGS', 'FNBOM', 'MFM', 'PKP', 'PKR', 'ADMIN'];
+}
+$show_team_filter = (count($np_team_codes) + count($project_team_codes)) > 1;
+
+// --- NON-PROJECT TEAM -> ELIGIBLE PIC POOL (COMBINED only) ----------
+// Used for filtering dashboard UI by team.
+$np_pics_by_team  = [];   // 'CSGSM' => [pic, ...]
+if ($persona === 'COMBINED') {
+    try {
+        $pmrows = $pdo->query("SELECT name as pic_name, team_name FROM users WHERE role IN ('PIC', 'Admin') AND name IS NOT NULL AND name <> ''")->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($pmrows as $pm) {
+            $code = $np_team_code($pm['team_name'] ?? '');
+            if ($code === '') { continue; }
+            $np_pics_by_team[$code][$pm['pic_name']] = true;
+        }
+    } catch (PDOException $e) {
+        $np_pics_by_team = [];
+    }
+    foreach ($np_pics_by_team as $code => $set) { $names = array_keys($set); sort($names); $np_pics_by_team[$code] = $names; }
+}
+
+// --- CALCULATE SMART STATUS ---
+foreach ($all_prs as &$pr) {
+    $has_canv = !empty(trim((string)$pr['canvassing_no']));
+    $has_po   = !empty(trim((string)$pr['po_number']));
+    $raw_status = strtolower(trim((string)$pr['status_ticket']));
+
+    $canvassing_status = strtolower(trim((string)($pr['canvassing_status'] ?? '')));
+
+    if (strpos($canvassing_status, 'cancel') !== false) {
+        $pr['display_status'] = 'Canvassing Cancelled';
+    } elseif (strpos($raw_status, 'escalated') !== false) {
+        $pr['display_status'] = 'Escalated';
+    } elseif (strpos($raw_status, 'reject') !== false || strpos($raw_status, 'revise') !== false) {
+        $pr['display_status'] = 'Sendback';
+    } elseif ($has_po) {
+        $pr['display_status'] = 'PO Created';
+    } elseif ($has_canv) {
+        $pr['display_status'] = 'On Progress';
+    } else {
+        $pr['display_status'] = 'Outstanding';
+    }
+}
+unset($pr);
+
+// --- UNIFIED WORKLOAD (persona-aware) --------------------------------------
+// NONPROJECT: open PRs (no PO) per assigned_pic.
+// PROJECT:    ticket+P.Group units per effective Project officer.
+// COMBINED:   both, summed by name into one chart. Units differ between sources
+// (see the chart subtitle); the bar tooltip always shows the full name.
+$workload_merged = $workload_np;
+foreach ($project_workload as $name => $cnt) {
+    $workload_merged[$name] = ($workload_merged[$name] ?? 0) + $cnt;
+}
+arsort($workload_merged);
+$chart_labels = array_keys($workload_merged);
+$chart_counts = array_values($workload_merged);
+
+$chart_raw_data = [];
+foreach ($all_prs as $pr) {
+    if (empty($pr['assigned_pic'])) continue;
+    $teamName = 'Unknown Team';
+    if (($pr['_row_type'] ?? '') === 'nonproject') {
+        $picActualTeam = null;
+        foreach ($np_pics_by_team as $t => $pics) {
+            if (in_array($pr['assigned_pic'], $pics, true)) {
+                $picActualTeam = $t;
+                break;
+            }
+        }
+        $teamName = $picActualTeam ? $picActualTeam : (!empty($pr['np_team']) ? $pr['np_team'] : 'Unknown Team');
+    } else {
+        $teamName = !empty($pr['team_code']) ? $pr['team_code'] : 'Unknown Team';
+    }
+    $chart_raw_data[] = [
+        'ticket_no' => $pr['ticket_no'],
+        'assigned_pic' => $pr['assigned_pic'],
+        'team_name' => $teamName,
+        'canvassing_no' => $pr['canvassing_no'] ?? '',
+        'po_number' => $pr['po_number'] ?? '',
+        'po_amount' => (float)($pr['po_amount'] ?? 0)
+    ];
+}
+
+$unique_tickets = array_unique(array_column($all_prs, 'ticket_no'));
+$unique_porgs = array_filter(array_unique(array_column($all_prs, 'p_org')));
+$unique_requestors = array_filter(array_unique(array_column($all_prs, 'requestor_name')));
+$unique_statuses = array_filter(array_unique(array_column($all_prs, 'display_status')));
+
+sort($unique_tickets);
+sort($unique_porgs);
+sort($unique_requestors);
+sort($unique_statuses);
+
+// --- LAST UPDATED (Task C) --------------------------------------------------
+// Newest prs.created_at
+$last_updated_label = 'unavailable';
+try {
+    date_default_timezone_set('Asia/Jakarta');
+    $li = $pdo->query("SELECT MAX(created_at) FROM prs")->fetchColumn();
+    if (!empty($li)) { $last_updated_label = date('d M Y, H:i', strtotime($li)) . ' WIB'; }
+} catch (PDOException $e) {
+    $last_updated_label = 'unavailable';
+}
+?>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js" defer></script>
+<link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css">
+<script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+
+<style>
+/* Compact search/filter toolbar — mirrors the Project dashboard, keeps the
+   table header a single clean row instead of a thick multi-row header. */
+.filt-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: #6b7280; margin-bottom: 2px; }
+.filt-input { padding: 5px 8px; font-size: 12px; line-height: 1.2; border: 1px solid #d1d5db; border-radius: 6px; background: #fff; color: #374151; width: 100%; min-width: 0; box-sizing: border-box; }
+.filt-input:focus { outline: none; border-color: #6366f1; box-shadow: 0 0 0 1px #6366f1; }
+/* Filter grid items must be free to shrink below their content's natural width,
+   otherwise a single wide control (e.g. Global Search) forces the whole grid --
+   and the card around it -- wider than the viewport instead of wrapping to a
+   new row. No overflow:hidden here: the P.ORG/Requestor/Status/Assigned PIC
+   dropdown panels are absolutely-positioned children that must still be able
+   to render outside this card's box. */
+#prTable_filters .filt-cell { min-width: 0; }
+#prTable_wrapper .dataTables_length { margin-bottom: .5rem; font-size: 12px; }
+/* Per-column multi-select dropdowns now live in the toolbar, not in <th>. */
+.col-filter { position: relative; }
+.col-filter .filter-dropdown { z-index: 60; }
+.col-trigger { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 6px; cursor: pointer; text-align: left; }
+.col-trigger .col-trigger-label { color: #6b7280; }
+/* Lightweight highlight for line rows selected for manual reassignment. The
+   !important + child selector beats DataTables' default row striping. */
+tr.line-row-selected > td { background-color: #e0e7ff !important; }
+tr.line-row-selected > td:first-child { box-shadow: inset 3px 0 0 0 #6366f1; }
+/* Line-selection area only: Shift/Ctrl/Cmd-click for range/toggle selection is a
+   click-drag-like gesture, which browsers also interpret as a text-selection
+   extension (blue highlight). Scoped to the PR table body so unrelated pages and
+   the rest of this page keep normal text selection. */
+#prTable tbody {
+    user-select: none;
+    -webkit-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+}
+</style>
+
+<div class="mb-6 flex flex-col lg:flex-row lg:justify-between lg:items-end gap-4 border-b pb-4">
+    <div>
+        <h2 class="text-2xl font-bold text-gray-800">Manager Command Center</h2>
+        <p class="text-sm text-gray-600">Analytics, advanced filtering, and manual overrides.</p>
+    </div>
+    <div class="text-xs text-gray-500 lg:text-right">Last updated: <span class="font-semibold text-gray-700"><?= htmlspecialchars($last_updated_label) ?></span></div>
+</div>
+
+<!-- Reusable reassignment feedback modal. Always present but hidden; the JS helper
+     showReassignFeedbackModal(type,title,message) fills and shows it for AJAX
+     success/error, the mixed-ticket warning, and the non-AJAX flash fallback. Only
+     the icon path, accent colours and text change between states. -->
+<div id="reassignFeedbackModal" class="fixed z-50 inset-0 hidden overflow-y-auto">
+  <div class="flex items-end justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
+    <div class="fixed inset-0 bg-gray-500 bg-opacity-75 transition-opacity backdrop-blur-sm" id="reassignFeedbackOverlay"></div>
+    <span class="hidden sm:inline-block sm:align-middle sm:h-screen">&#8203;</span>
+    <div class="inline-block align-bottom bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-md sm:w-full">
+      <div class="bg-white px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
+        <div class="sm:flex sm:items-start">
+          <div id="reassignFeedbackIconWrap" class="mx-auto flex-shrink-0 flex items-center justify-center h-12 w-12 rounded-full bg-green-100 sm:mx-0 sm:h-10 sm:w-10">
+            <svg id="reassignFeedbackIcon" class="h-6 w-6 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path id="reassignFeedbackIconPath" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg>
+          </div>
+          <div class="mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left w-full">
+            <h3 id="reassignFeedbackTitle" class="text-lg font-medium text-gray-900">Reassignment</h3>
+            <div class="mt-2">
+              <p id="reassignFeedbackMessage" class="text-sm text-gray-600"></p>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="bg-gray-50 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
+        <button type="button" id="reassignFeedbackClose" class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-green-600 hover:bg-green-700 text-base font-bold text-white sm:ml-3 sm:w-auto sm:text-sm">Got it</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="bg-white shadow-md rounded-lg p-6 border border-gray-200 mb-8">
+    <div class="mb-4 flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <h3 class="text-lg font-semibold text-gray-800">Current Team Workload</h3>
+        <div class="flex items-center space-x-2">
+            <label for="workloadMetricSelect" class="text-xs font-bold text-gray-600">Calculate By:</label>
+            <select id="workloadMetricSelect" class="block w-40 pl-3 pr-10 py-1.5 text-xs border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 rounded-md">
+                <option value="ticket_lines">Ticket Lines</option>
+                <option value="unique_tickets">Unique Tickets</option>
+                <option value="canvassing">Canvassing</option>
+                <option value="po">PO</option>
+                <option value="po_amount">PO Amount</option>
+            </select>
+            <button type="button" id="showAllPicsBtn" class="hidden ml-2 px-3 py-1.5 text-xs font-medium rounded text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 transition-colors">
+                Show All PICs
+            </button>
+        </div>
+    </div>
+    
+    <div class="flex flex-col md:flex-row gap-6 w-full">
+        <div id="teamChartContainer" class="relative h-64 w-full md:w-1/2 overflow-x-auto hidden">
+            <div class="viz-chart-loader absolute inset-0 z-10 flex items-center justify-center bg-white bg-opacity-80">
+                <div class="w-8 h-8 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin"></div>
+            </div>
+            <div id="workloadChartTeamWrap" class="h-full" style="min-width:100%;">
+                <canvas id="workloadChartTeam"></canvas>
+            </div>
+        </div>
+        <div id="picChartContainer" class="relative h-64 w-full md:w-1/2 overflow-x-auto">
+            <div class="viz-chart-loader absolute inset-0 z-10 flex items-center justify-center bg-white bg-opacity-80">
+                <div class="w-8 h-8 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin"></div>
+            </div>
+            <div id="workloadChartWrap" class="h-full" style="min-width:100%;">
+                <canvas id="workloadChart"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<?php
+// NEW FETCH: Grab the actual list of pending evaluations to populate the checklist
+$evalQuery = "
+    SELECT p.po_number, p.vendor_name, p.requestor_name, MAX(p.gr_date) as gr_date
+    FROM prs p
+    LEFT JOIN vendor_evaluations v ON p.po_number = v.po_number
+    WHERE p.po_number IS NOT NULL AND p.po_number != ''
+      AND p.vendor_name IS NOT NULL AND p.vendor_name != ''
+      AND v.id IS NULL
+      AND (p.pr_date >= '2026-05-01' OR p.pr_date IS NULL)
+    GROUP BY p.po_number, p.vendor_name, p.requestor_name
+    HAVING MAX(p.gr_date) IS NOT NULL AND MAX(p.gr_date) <= CURDATE()
+    ORDER BY gr_date ASC
+";
+$pending_evals = $pdo->query($evalQuery)->fetchAll();
+$pending_eval_count = count($pending_evals);
+?>
+
+<?php if ($pending_eval_count > 0): ?>
+    <div class="bg-blue-50 border-l-4 border-blue-500 p-4 mb-6 rounded-r-lg shadow-sm flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+        <div class="flex items-center">
+            <div class="flex-shrink-0">
+                <svg class="h-6 w-6 text-blue-500" fill="currentColor" viewBox="0 0 24 24"><path d="M12.031 6.172c-3.181 0-5.767 2.586-5.768 5.766-.001 1.298.38 2.27 1.019 3.287l-.582 2.128 2.182-.573c.978.58 1.911.928 3.145.929 3.178 0 5.767-2.587 5.768-5.766.001-3.187-2.575-5.77-5.764-5.771zm3.392 8.244c-.144.405-.837.774-1.17.824-.299.045-.677.063-1.092-.069-.252-.08-.575-.988-.365-1.739-.751-2.874-2.502-2.961-2.617-.087-.116-.708-.94-.708-1.793s.448-1.273.607-1.446c.159-.173.346-.217.462-.217l.332.006c.106.005.249-.04.39.298.144.347.491 1.2.534 1.287.043.087.072.188.014.304-.058.116-.087.188-.173.289l-.26.304c-.087.086-.177.18-.076.338.101.158.449.741.964 1.185.667.574 1.265.761 1.409.818.144.058.23.043.318-.043.087-.087.375-.433.476-.578.101-.144.202-.116.346-.058.144.057.915.433 1.073.5.158.065.26.101.298.159.043.058.043.346-.101.751z"/></svg>
+            </div>
+            <div class="ml-3">
+                <p class="text-sm text-blue-800 font-bold">Action Required: Requestor Slacking</p>
+                <p class="text-xs md:text-sm text-blue-700">There are <strong><?= $pending_eval_count ?></strong> POs that have passed their GR Date but lack evaluations.</p>
+            </div>
+        </div>
+        <div class="w-full md:w-auto">
+            <button type="button" id="open-wa-modal-btn"
+                    title="Select POs, review the per-requestor summary, then send."
+                    class="w-full md:w-auto justify-center bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg text-xs md:text-sm shadow-sm transition flex items-center">
+                Shoot Evaluation Reminders
+            </button>
+        </div>
+    </div>
+<?php endif; ?>
+
+<div class="mb-6 flex flex-col gap-4 bg-gray-50 p-4 rounded-xl border border-gray-200 shadow-sm">
+    <div class="flex flex-wrap items-center gap-2">
+        <span class="text-xs font-bold text-gray-500 uppercase tracking-wider mr-2">Filter by Status:</span>
+        <button type="button" class="status-filter-btn px-4 py-2 bg-indigo-600 text-white text-xs md:text-sm font-bold rounded-lg shadow-sm border border-indigo-600 ring-2 ring-offset-2 hover:shadow-md transform hover:-translate-y-0.5 transition-all duration-150 focus:outline-none" data-status="">
+            All Statuses
+        </button>
+        <button type="button" class="status-filter-btn px-4 py-2 bg-white text-gray-700 text-xs md:text-sm font-bold rounded-lg shadow-sm border border-gray-200 hover:bg-gray-50 hover:shadow-md transform hover:-translate-y-0.5 transition-all duration-150 focus:outline-none" data-status="Outstanding">
+            Outstanding
+        </button>
+        <button type="button" class="status-filter-btn px-4 py-2 bg-white text-gray-700 text-xs md:text-sm font-bold rounded-lg shadow-sm border border-gray-200 hover:bg-gray-50 hover:shadow-md transform hover:-translate-y-0.5 transition-all duration-150 focus:outline-none" data-status="On Progress">
+            On Progress
+        </button>
+        <button type="button" class="status-filter-btn px-4 py-2 bg-white text-gray-700 text-xs md:text-sm font-bold rounded-lg shadow-sm border border-gray-200 hover:bg-gray-50 hover:shadow-md transform hover:-translate-y-0.5 transition-all duration-150 focus:outline-none" data-status="PO Created">
+            PO Created
+        </button>
+        <button type="button" class="status-filter-btn px-4 py-2 bg-white text-gray-700 text-xs md:text-sm font-bold rounded-lg shadow-sm border border-gray-200 hover:bg-gray-50 hover:shadow-md transform hover:-translate-y-0.5 transition-all duration-150 focus:outline-none" data-filter="manual-only">
+            Manual Assignments
+        </button>
+    </div>
+    <div class="flex flex-wrap items-center gap-2">
+        <span class="text-xs font-bold text-gray-500 uppercase tracking-wider mr-2">Filter by Type:</span>
+        <button type="button" class="type-filter-btn px-4 py-2 bg-indigo-600 text-white text-xs md:text-sm font-bold rounded-lg shadow-sm border border-indigo-600 ring-2 ring-offset-2 hover:shadow-md transform hover:-translate-y-0.5 transition-all duration-150 focus:outline-none" data-type="">
+            All Types
+        </button>
+        <button type="button" class="type-filter-btn px-4 py-2 bg-white text-gray-700 text-xs md:text-sm font-bold rounded-lg shadow-sm border border-gray-200 hover:bg-gray-50 hover:shadow-md transform hover:-translate-y-0.5 transition-all duration-150 focus:outline-none" data-type="intercompany">
+            Intercompany
+        </button>
+        <button type="button" class="type-filter-btn px-4 py-2 bg-white text-gray-700 text-xs md:text-sm font-bold rounded-lg shadow-sm border border-gray-200 hover:bg-gray-50 hover:shadow-md transform hover:-translate-y-0.5 transition-all duration-150 focus:outline-none" data-type="non-intercompany">
+            Non-Intercompany
+        </button>
+    </div>
+    <?php if ($show_team_filter): ?>
+    <div class="flex flex-wrap items-center gap-2">
+        <span class="text-xs font-bold text-gray-500 uppercase tracking-wider mr-2">Filter by Team:</span>
+        <button type="button" class="team-filter-btn px-4 py-2 bg-indigo-600 text-white text-xs md:text-sm font-bold rounded-lg shadow-sm border border-indigo-600 ring-2 ring-offset-2 hover:shadow-md transform hover:-translate-y-0.5 transition-all duration-150 focus:outline-none" data-group="">
+            All Teams
+        </button>
+        <?php foreach ($np_team_codes as $code): ?>
+        <button type="button" class="team-filter-btn px-4 py-2 bg-white text-gray-700 text-xs md:text-sm font-bold rounded-lg shadow-sm border border-gray-200 hover:bg-gray-50 hover:shadow-md transform hover:-translate-y-0.5 transition-all duration-150 focus:outline-none" data-npteam="<?= htmlspecialchars($code) ?>"><?= htmlspecialchars($code) ?></button>
+        <?php endforeach; ?>
+        <?php foreach ($project_team_codes as $gnum => $code): ?>
+        <button type="button" class="team-filter-btn px-4 py-2 bg-white text-gray-700 text-xs md:text-sm font-bold rounded-lg shadow-sm border border-gray-200 hover:bg-gray-50 hover:shadow-md transform hover:-translate-y-0.5 transition-all duration-150 focus:outline-none" data-group="<?= (int)$gnum ?>"><?= htmlspecialchars($code) ?></button>
+        <?php endforeach; ?>
+    </div>
+    <div class="mt-3 text-[11px] text-gray-600 bg-gray-50 px-3 py-2 rounded-lg border border-gray-200 shadow-inner">
+        <span class="font-bold text-gray-800 mr-2">Team Abbreviations:</span> 
+        <?php 
+        $legend_items = [];
+        foreach ($np_acronym_map as $full => $abbr) {
+            $legend_items[] = "<span class='font-bold text-indigo-700'>" . htmlspecialchars($abbr) . "</span> <span class='text-gray-500'>(" . htmlspecialchars($full) . ")</span>";
+        }
+        echo implode(" &bull; ", $legend_items);
+        ?>
+    </div>
+    <?php endif; ?>
+</div>
+
+<!-- COMPACT SEARCH / FILTER TOOLBAR (filters moved out of the table header) -->
+<div id="prTable_filters" class="mb-6 bg-white p-4 rounded-xl border border-gray-200 shadow-sm">
+    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-x-3 gap-y-3">
+        <div class="filt-cell flex flex-col min-w-0">
+            <label class="filt-label">Ticket No</label>
+            <input type="text" data-col="0" class="column-search-text filt-input" placeholder="Search...">
+        </div>
+        <div class="filt-cell flex flex-col min-w-0">
+            <label class="filt-label">P.ORG</label>
+            <div class="col-filter min-w-0">
+                <button type="button" class="filter-trigger filt-input col-trigger">
+                    <span class="col-trigger-label">All</span>
+                    <svg class="h-3.5 w-3.5 text-gray-400 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20"><path d="M3 3a1 1 0 011-1h12a1 1 0 011 1v3a1 1 0 01-.293.707L12 11.414V15a1 1 0 01-.293.707l-2 2A1 1 0 018 17v-5.586L3.293 6.707A1 1 0 013 6V3z"/></svg>
+                </button>
+                <div class="filter-dropdown hidden absolute top-full left-0 mt-1 w-full min-w-[12rem] rounded-md shadow-xl bg-white ring-1 ring-black ring-opacity-5 z-50 border border-gray-200">
+                    <div class="p-2 border-b bg-white"><input type="text" class="dropdown-search w-full px-2 py-1 text-xs border border-gray-300 rounded" placeholder="Search..."></div>
+                    <div class="px-3 py-2 border-b bg-gray-50"><label class="text-[10px] flex items-center cursor-pointer text-indigo-600 font-bold"><input type="checkbox" class="select-all-checkbox mr-1"> Select All</label></div>
+                    <div class="p-2 max-h-48 overflow-y-auto checkbox-list">
+                        <?php foreach ($unique_porgs as $val): ?>
+                        <label class="flex items-center p-1 hover:bg-indigo-50 rounded cursor-pointer"><input type="checkbox" class="col-checkbox h-3 w-3 text-indigo-600" value="<?= htmlspecialchars($val) ?>"><span class="ml-2 text-xs text-gray-700"><?= htmlspecialchars($val) ?></span></label>
+                        <?php endforeach; ?>
+                    </div>
+                    <div class="p-2 border-t bg-gray-50 flex justify-end"><button type="button" class="clear-filter text-xs text-gray-500 mr-4">Clear</button><button type="button" data-col="2" class="apply-filter bg-indigo-600 text-white text-[10px] px-3 py-1 rounded">Apply</button></div>
+                </div>
+            </div>
+        </div>
+        <div class="filt-cell flex flex-col min-w-0">
+            <label class="filt-label">Requestor</label>
+            <div class="col-filter min-w-0">
+                <button type="button" class="filter-trigger filt-input col-trigger">
+                    <span class="col-trigger-label">All</span>
+                    <svg class="h-3.5 w-3.5 text-gray-400 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20"><path d="M3 3a1 1 0 011-1h12a1 1 0 011 1v3a1 1 0 01-.293.707L12 11.414V15a1 1 0 01-.293.707l-2 2A1 1 0 018 17v-5.586L3.293 6.707A1 1 0 013 6V3z"/></svg>
+                </button>
+                <div class="filter-dropdown hidden absolute top-full left-0 mt-1 w-full min-w-[12rem] rounded-md shadow-xl bg-white ring-1 ring-black ring-opacity-5 z-50 border border-gray-200">
+                    <div class="p-2 border-b bg-white"><input type="text" class="dropdown-search w-full px-2 py-1 text-xs border border-gray-300 rounded" placeholder="Search..."></div>
+                    <div class="px-3 py-2 border-b bg-gray-50"><label class="text-[10px] flex items-center cursor-pointer text-indigo-600 font-bold"><input type="checkbox" class="select-all-checkbox mr-1"> Select All</label></div>
+                    <div class="p-2 max-h-48 overflow-y-auto checkbox-list">
+                        <?php foreach ($unique_requestors as $val): ?>
+                        <label class="flex items-center p-1 hover:bg-indigo-50 rounded cursor-pointer"><input type="checkbox" class="col-checkbox h-3 w-3 text-indigo-600" value="<?= htmlspecialchars($val) ?>"><span class="ml-2 text-xs text-gray-700"><?= htmlspecialchars($val) ?></span></label>
+                        <?php endforeach; ?>
+                    </div>
+                    <div class="p-2 border-t bg-gray-50 flex justify-end"><button type="button" class="clear-filter text-xs text-gray-500 mr-4">Clear</button><button type="button" data-col="3" class="apply-filter bg-indigo-600 text-white text-[10px] px-3 py-1 rounded">Apply</button></div>
+                </div>
+            </div>
+        </div>
+        <div class="filt-cell flex flex-col min-w-0">
+            <label class="filt-label">Item Description</label>
+            <input type="text" data-col="4" class="column-search-text filt-input" placeholder="Search...">
+        </div>
+        <div class="filt-cell flex flex-col min-w-0">
+            <label class="filt-label">Canvassing No</label>
+            <input type="text" data-col="5" class="column-search-text filt-input" placeholder="Search...">
+        </div>
+        <div class="filt-cell flex flex-col min-w-0">
+            <label class="filt-label">Status</label>
+            <div class="col-filter min-w-0">
+                <button type="button" class="filter-trigger filt-input col-trigger">
+                    <span class="col-trigger-label">All</span>
+                    <svg class="h-3.5 w-3.5 text-gray-400 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20"><path d="M3 3a1 1 0 011-1h12a1 1 0 011 1v3a1 1 0 01-.293.707L12 11.414V15a1 1 0 01-.293.707l-2 2A1 1 0 018 17v-5.586L3.293 6.707A1 1 0 013 6V3z"/></svg>
+                </button>
+                <div class="filter-dropdown hidden absolute top-full left-0 mt-1 w-full min-w-[12rem] rounded-md shadow-xl bg-white ring-1 ring-black ring-opacity-5 z-50 border border-gray-200">
+                    <div class="p-2 border-b bg-white"><input type="text" class="dropdown-search w-full px-2 py-1 text-xs border border-gray-300 rounded" placeholder="Search..."></div>
+                    <div class="px-3 py-2 border-b bg-gray-50"><label class="text-[10px] flex items-center cursor-pointer text-indigo-600 font-bold"><input type="checkbox" class="select-all-checkbox mr-1"> Select All</label></div>
+                    <div class="p-2 max-h-48 overflow-y-auto checkbox-list">
+                        <?php foreach ($unique_statuses as $val): ?>
+                        <label class="flex items-center p-1 hover:bg-indigo-50 rounded cursor-pointer"><input type="checkbox" class="col-checkbox h-3 w-3 text-indigo-600" value="<?= htmlspecialchars($val) ?>"><span class="ml-2 text-xs text-gray-700"><?= htmlspecialchars($val) ?></span></label>
+                        <?php endforeach; ?>
+                    </div>
+                    <div class="p-2 border-t bg-gray-50 flex justify-end"><button type="button" class="clear-filter text-xs text-gray-500 mr-4">Clear</button><button type="button" data-col="6" class="apply-filter bg-indigo-600 text-white text-[10px] px-3 py-1 rounded">Apply</button></div>
+                </div>
+            </div>
+        </div>
+        <div class="filt-cell flex flex-col min-w-0">
+            <label class="filt-label">PO Number</label>
+            <input type="text" data-col="7" class="column-search-text filt-input" placeholder="Search...">
+        </div>
+        <div class="filt-cell flex flex-col min-w-0">
+            <label class="filt-label">Assigned PIC</label>
+            <div class="col-filter min-w-0">
+                <button type="button" class="filter-trigger filt-input col-trigger">
+                    <span class="col-trigger-label">All</span>
+                    <svg class="h-3.5 w-3.5 text-gray-400 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20"><path d="M3 3a1 1 0 011-1h12a1 1 0 011 1v3a1 1 0 01-.293.707L12 11.414V15a1 1 0 01-.293.707l-2 2A1 1 0 018 17v-5.586L3.293 6.707A1 1 0 013 6V3z"/></svg>
+                </button>
+                <div class="filter-dropdown hidden absolute top-full left-0 mt-1 w-full min-w-[12rem] rounded-md shadow-xl bg-white ring-1 ring-black ring-opacity-5 z-50 border border-gray-200">
+                    <div class="p-2 border-b bg-white"><input type="text" class="dropdown-search w-full px-2 py-1 text-xs border border-gray-300 rounded" placeholder="Search..."></div>
+                    <div class="px-3 py-2 border-b bg-gray-50"><label class="text-[10px] flex items-center cursor-pointer text-indigo-600 font-bold"><input type="checkbox" class="select-all-checkbox mr-1"> Select All</label></div>
+                    <div class="p-2 max-h-48 overflow-y-auto checkbox-list">
+                        <label class="flex items-center p-1 hover:bg-indigo-50 rounded cursor-pointer">
+                            <input type="checkbox" class="col-checkbox h-3 w-3 text-indigo-600" value="Unassigned">
+                            <span class="ml-2 text-xs text-yellow-600 font-bold">-- Unassigned --</span>
+                        </label>
+                        <?php foreach ($all_pics as $pic): ?>
+                        <label class="flex items-center p-1 hover:bg-indigo-50 rounded cursor-pointer"><input type="checkbox" class="col-checkbox h-3 w-3 text-indigo-600" value="<?= htmlspecialchars($pic) ?>"><span class="ml-2 text-xs text-gray-700"><?= htmlspecialchars($pic) ?></span></label>
+                        <?php endforeach; ?>
+                    </div>
+                    <div class="p-2 border-t bg-gray-50 flex justify-end"><button type="button" class="clear-filter text-xs text-gray-500 mr-4">Clear</button><button type="button" data-col="8" class="apply-filter bg-indigo-600 text-white text-[10px] px-3 py-1 rounded">Apply</button></div>
+                </div>
+            </div>
+        </div>
+        <div class="filt-cell flex flex-col min-w-0">
+            <label class="filt-label">Global Search</label>
+            <input type="text" id="globalSearch" class="filt-input" placeholder="Search all columns...">
+        </div>
+    </div>
+</div>
+
+<div class="bg-white shadow-md rounded-lg border border-gray-200 mb-8 relative">
+    <div class="viz-table-loader absolute inset-0 z-20 flex flex-col items-center justify-center bg-white bg-opacity-80 rounded-lg">
+        <div class="w-8 h-8 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin"></div>
+        <p class="mt-3 text-xs font-semibold text-gray-500">Loading records…</p>
+    </div>
+    <!-- Line-level manual reassignment action bar: appears when one or more line
+         items are checked. Assignments apply per ticket (same-ticket enforced). -->
+    <div id="lineSelectBar" class="hidden sticky top-0 z-30 flex items-center justify-between gap-3 px-6 py-3 bg-indigo-50 border-b border-indigo-200 rounded-t-lg">
+        <div class="flex flex-col">
+            <span class="text-sm font-bold text-indigo-800"><span id="lineSelectCount">0</span> line item(s) selected</span>
+            <span id="lineSelectNote" class="hidden text-[11px] font-semibold text-amber-600 mt-0.5"></span>
+        </div>
+        <div class="flex items-center gap-2">
+            <button type="button" id="lineSelectClear" class="text-xs text-gray-500 hover:text-gray-700">Clear</button>
+            <button type="button" id="reassignSelectedBtn" class="inline-flex items-center px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-lg shadow-sm">Reassign Selected Lines &rarr;</button>
+        </div>
+    </div>
+    <div class="overflow-y-auto px-6 pb-6 pt-2" style="max-height: 750px;">
+        <table id="prTable" class="min-w-full leading-normal w-full text-left">
+            <thead>
+                <tr>
+                    <th class="bg-gray-100 px-4 py-2.5 border-b-2 border-gray-300 shadow-sm min-w-[150px] text-xs font-bold text-gray-600 uppercase tracking-wider">Ticket No</th>
+                    <th class="bg-gray-100 px-4 py-2.5 border-b-2 border-gray-300 shadow-sm min-w-[130px] text-xs font-bold text-gray-600 uppercase tracking-wider">PR Date</th>
+                    <th class="bg-gray-100 px-4 py-2.5 border-b-2 border-gray-300 shadow-sm min-w-[120px] text-xs font-bold text-gray-600 uppercase tracking-wider">P.ORG</th>
+                    <th class="bg-gray-100 px-4 py-2.5 border-b-2 border-gray-300 shadow-sm min-w-[150px] text-xs font-bold text-gray-600 uppercase tracking-wider">Requestor</th>
+                    <th class="bg-gray-100 px-4 py-2.5 border-b-2 border-gray-300 shadow-sm min-w-[200px] text-xs font-bold text-gray-600 uppercase tracking-wider">Item Description</th>
+                    <th class="bg-gray-100 px-4 py-2.5 border-b-2 border-gray-300 shadow-sm min-w-[150px] text-xs font-bold text-gray-600 uppercase tracking-wider">Canvassing No</th>
+                    <th class="bg-gray-100 px-4 py-2.5 border-b-2 border-gray-300 shadow-sm min-w-[130px] text-xs font-bold text-gray-600 uppercase tracking-wider">Status</th>
+                    <th class="bg-gray-100 px-4 py-2.5 border-b-2 border-gray-300 shadow-sm min-w-[140px] text-xs font-bold text-gray-600 uppercase tracking-wider">PO Number</th>
+                    <th class="bg-gray-100 px-4 py-2.5 border-b-2 border-gray-300 shadow-sm min-w-[170px] text-xs font-bold text-gray-600 uppercase tracking-wider">Assigned PIC</th>
+                    <th class="bg-gray-100 px-4 py-2.5 border-b-2 border-gray-300 shadow-sm min-w-[90px] text-xs font-bold text-gray-600 uppercase tracking-wider text-center"><input type="checkbox" id="selectAllCheckbox" class="h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500" title="Select All Visible Lines"></th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($all_prs as $pr): ?>
+                    <?php if (($pr['_row_type'] ?? 'nonproject') === 'project'): ?>
+                    <?php
+                        $p_intercompany = !empty($pr['is_intercompany']);
+                        $p_assigned     = trim((string)($pr['assigned_pic'] ?? '')) !== '';
+                        $statusClass = 'bg-gray-100 text-gray-800 border-gray-200';
+                        if ($pr['display_status'] === 'Outstanding') $statusClass = 'bg-red-100 text-red-800 border-red-200';
+                        if ($pr['display_status'] === 'Escalated')   $statusClass = 'bg-orange-100 text-orange-800 border-orange-200';
+                        if ($pr['display_status'] === 'Sendback')    $statusClass = 'bg-purple-100 text-purple-800 border-purple-200';
+                        if ($pr['display_status'] === 'Canvassing Cancelled') $statusClass = 'bg-red-500 text-white border-red-600';
+                        if ($pr['display_status'] === 'On Progress') $statusClass = 'bg-yellow-100 text-yellow-800 border-yellow-200';
+                        if ($pr['display_status'] === 'PO Created')  $statusClass = 'bg-green-100 text-green-800 border-green-200';
+                    ?>
+                    <tr class="hover:bg-indigo-50 transition border-b border-gray-100"
+                        data-row-type="project"
+                        data-group="<?= (int)$pr['project_group_number'] ?>"
+                        data-pgroup="<?= htmlspecialchars($pr['p_group']) ?>"
+                        data-assigned-by-ai="<?= (int)($pr['assigned_by_ai'] ?? 0) ?>"
+                        data-ticket-type="<?= htmlspecialchars(strtolower($pr['ticket_type'] ?? '')) ?>">
+                        <td class="px-4 py-3 text-sm font-medium text-indigo-700 cursor-copy ticket-no-cell relative hover:text-indigo-900 group" title="Click to copy">
+                            <span class="ticket-no-text"><?= htmlspecialchars($pr['ticket_no']) ?></span>
+                            <span class="absolute left-1/2 -top-6 -translate-x-1/2 bg-gray-800 text-white text-[10px] px-2 py-1 rounded opacity-0 transition-opacity duration-200 pointer-events-none copy-toast whitespace-nowrap">Copied!</span>
+                            <div class="mt-0.5">
+                                <span class="inline-block bg-gray-50 text-gray-700 border border-gray-200 py-0.5 px-1.5 rounded text-[10px] font-bold"><?= htmlspecialchars($pr['p_group']) ?></span>
+                                <span class="text-[10px] font-bold text-indigo-500 ml-1 tracking-wide" title="<?= htmlspecialchars($pr['project_group_name']) ?>"><?= htmlspecialchars($pr['team_code']) ?></span>
+                            </div>
+                        </td>
+                        <td class="px-4 py-3 text-sm text-gray-700" data-order="<?= $pr['pr_date'] ? date('Y-m-d', strtotime($pr['pr_date'])) : '' ?>"><?= $pr['pr_date'] ? date('d M Y', strtotime($pr['pr_date'])) : '-' ?></td>
+                        <td class="px-4 py-3 text-sm text-gray-700"><?= htmlspecialchars($pr['p_org']) ?></td>
+                        <td class="px-4 py-3 text-sm text-gray-700"><?= htmlspecialchars($pr['requestor_name']) ?></td>
+                        <td class="px-4 py-3 text-sm text-gray-700">
+                                <div class="truncate max-w-[200px] text-indigo-600 hover:text-indigo-900 cursor-pointer hover:underline pr-taxonomy-clickable"
+                                     title="View Taxonomy: <?= htmlspecialchars($pr['item_description']) ?>"
+                                     data-ticket-no="<?= htmlspecialchars($pr['ticket_no']) ?>">
+                                     <?= htmlspecialchars($pr['item_description']) ?>
+                                </div>
+                            <?php if (($pr['line_count'] ?? 1) > 1): ?><div class="text-[10px] text-gray-400 mt-0.5"><?= (int)$pr['line_count'] ?> lines</div><?php endif; ?>
+                        </td>
+                        <td class="px-4 py-3 text-sm text-gray-700" data-search="<?= htmlspecialchars($pr['canvassing_no'] ?: '') ?>">
+                            <div><?= htmlspecialchars($pr['canvassing_no'] ?: '--') ?></div>
+                            <?php if ($pr['canvassing_date']): ?><div class="text-[10px] text-gray-400 mt-0.5"><?= date('d M Y', strtotime($pr['canvassing_date'])) ?></div><?php endif; ?>
+                        </td>
+                        <td class="px-4 py-3 text-sm" data-search="<?= htmlspecialchars($pr['display_status']) ?>">
+                            <span class="<?= $statusClass ?> py-1 px-2 rounded-md text-[10px] font-bold border inline-block w-full text-center"><?= htmlspecialchars($pr['display_status']) ?></span>
+                        </td>
+                        <td class="px-4 py-3 text-sm text-gray-700 text-center"><?= htmlspecialchars($pr['po_number'] ?: '-') ?></td>
+                        <td class="px-4 py-3 text-sm" data-search="<?= htmlspecialchars($pr['assigned_pic'] ?: ($pr['resolved_officer'] ?: 'Unassigned')) ?>">
+                            <?php if ($p_intercompany): ?>
+                                <span class="inline-flex items-center px-3 py-1.5 border border-blue-200 shadow-sm text-xs font-medium rounded text-blue-800 bg-blue-50" title="Routed via admin mappings / system rule">
+                                    <span class="font-semibold"><?= htmlspecialchars($pr['assigned_pic'] ?: '--') ?></span>
+                                    <span class="ml-1 text-[10px] text-blue-500 font-semibold">&middot; System</span>
+                                </span>
+                            <?php else: ?>
+                                <button type="button"
+                                        class="project-assign-btn inline-flex items-center px-3 py-1.5 border border-gray-300 shadow-sm text-xs font-medium rounded text-gray-700 bg-white hover:bg-indigo-50 focus:outline-none transition-colors"
+                                        data-ticket="<?= htmlspecialchars($pr['ticket_no']) ?>"
+                                        data-pgroup="<?= htmlspecialchars($pr['p_group']) ?>"
+                                        data-officer="<?= htmlspecialchars($pr['assigned_pic'] ?? '') ?>">
+                                    <?php if ($p_assigned): ?>
+                                        <span class="text-indigo-700 font-semibold"><?= htmlspecialchars($pr['assigned_pic']) ?> (Manual)</span>
+                                    <?php elseif (!empty($pr['resolved_officer'])): ?>
+                                        <span class="text-amber-700 font-semibold"><?= htmlspecialchars($pr['resolved_officer']) ?></span>
+                                        <span class="ml-1 text-[9px] text-amber-500 font-bold uppercase tracking-wider">GP Officer</span>
+                                    <?php else: ?>
+                                        <span class="text-yellow-600 italic">Unassigned</span>
+                                    <?php endif; ?>
+                                    <svg class="ml-2 h-3 w-3 text-gray-400" fill="currentColor" viewBox="0 0 20 20"><path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zM11.379 5.793L3 14.172V17h2.828l8.38-8.379-2.83-2.828z"></path></svg>
+                                </button>
+                            <?php endif; ?>
+                        </td>
+                        <td class="px-4 py-3 text-center"></td>
+                    </tr>
+                    <?php else: ?>
+                    <tr class="hover:bg-indigo-50 transition border-b border-gray-100" data-row-type="nonproject" data-group="" data-team="<?= htmlspecialchars($pr['np_team'] ?? '') ?>" data-assigned-pic="<?= htmlspecialchars($pr['assigned_pic'] ?? '') ?>" data-assigned-by-ai="<?= (int)$pr['assigned_by_ai'] ?>" data-ticket-type="<?= htmlspecialchars(strtolower($pr['ticket_type'] ?? '')) ?>">
+                        <td class="px-4 py-3 text-sm font-medium text-indigo-700 cursor-copy ticket-no-cell relative hover:text-indigo-900 group" title="Click to copy">
+                            <span class="ticket-no-text"><?= htmlspecialchars($pr['ticket_no']) ?></span>
+                            <span class="absolute left-1/2 -top-6 -translate-x-1/2 bg-gray-800 text-white text-[10px] px-2 py-1 rounded opacity-0 transition-opacity duration-200 pointer-events-none copy-toast whitespace-nowrap">Copied!</span>
+                        </td>
+                        <td class="px-4 py-3 text-sm text-gray-700" data-order="<?= $pr['pr_date'] ? date('Y-m-d', strtotime($pr['pr_date'])) : '' ?>"><?= $pr['pr_date'] ? date('d M Y', strtotime($pr['pr_date'])) : '-' ?></td>
+                        <td class="px-4 py-3 text-sm text-gray-700"><?= htmlspecialchars($pr['p_org']) ?></td>
+                        <td class="px-4 py-3 text-sm text-gray-700"><?= htmlspecialchars($pr['requestor_name']) ?></td>
+                        <td class="px-4 py-3 text-sm text-gray-700">
+                                <div class="truncate max-w-[200px] text-indigo-600 hover:text-indigo-900 cursor-pointer hover:underline pr-taxonomy-clickable"
+                                     title="View Taxonomy: <?= htmlspecialchars($pr['item_description']) ?>"
+                                     data-ticket-no="<?= htmlspecialchars($pr['ticket_no']) ?>">
+                                     <?= htmlspecialchars($pr['item_description']) ?>
+                                </div>
+                            <?php if (($pr['ticket_line_item'] ?? '') !== ''): ?><div class="text-[10px] text-gray-400 mt-0.5">Line <?= htmlspecialchars($pr['ticket_line_item']) ?></div><?php endif; ?>
+                        </td>
+                        <td class="px-4 py-3 text-sm text-gray-700" data-search="<?= htmlspecialchars($pr['canvassing_no'] ?: '') ?>">
+                            <div><?= htmlspecialchars($pr['canvassing_no'] ?: '--') ?></div>
+                            <?php if ($pr['canvassing_date']): ?><div class="text-[10px] text-gray-400 mt-0.5"><?= date('d M Y', strtotime($pr['canvassing_date'])) ?></div><?php endif; ?>
+                        </td>
+                        <td class="px-4 py-3 text-sm" data-search="<?= htmlspecialchars($pr['display_status']) ?>">
+                            <?php
+                                $statusClass = 'bg-gray-100 text-gray-800 border-gray-200';
+                                if ($pr['display_status'] === 'Outstanding') $statusClass = 'bg-red-100 text-red-800 border-red-200';
+                                if ($pr['display_status'] === 'Escalated') $statusClass = 'bg-orange-100 text-orange-800 border-orange-200';
+                                if ($pr['display_status'] === 'Sendback') $statusClass = 'bg-purple-100 text-purple-800 border-purple-200';
+                                if ($pr['display_status'] === 'Canvassing Cancelled') $statusClass = 'bg-red-500 text-white border-red-600';
+                                if ($pr['display_status'] === 'On Progress') $statusClass = 'bg-yellow-100 text-yellow-800 border-yellow-200';
+                                if ($pr['display_status'] === 'PO Created') $statusClass = 'bg-green-100 text-green-800 border-green-200';
+                            ?>
+                            <span class="<?= $statusClass ?> py-1 px-2 rounded-md text-[10px] font-bold border inline-block w-full text-center">
+                                <?= htmlspecialchars($pr['display_status']) ?>
+                            </span>
+                        </td>
+                        <td class="px-4 py-3 text-sm text-gray-700 text-center"><?= htmlspecialchars($pr['po_number'] ?: '-') ?></td>
+                        <td class="px-4 py-3 text-sm" data-search="<?= htmlspecialchars($pr['assigned_pic'] ?: 'Unassigned') ?>">
+                            <button type="button"
+                                    class="open-modal-btn inline-flex items-center px-3 py-1.5 border border-gray-300 shadow-sm text-xs font-medium rounded text-gray-700 bg-white hover:bg-indigo-50 focus:outline-none transition-colors"
+                                    data-ticket="<?= htmlspecialchars($pr['ticket_no']) ?>"
+                                    data-line="<?= htmlspecialchars($pr['ticket_line_item'] ?? '') ?>"
+                                    data-pic="<?= htmlspecialchars($pr['assigned_pic'] ?? '') ?>">
+                                <?php if ($pr['assigned_pic']): ?>
+                                    <span class="<?= !$pr['assigned_by_ai'] ? 'text-indigo-700 font-semibold' : '' ?>">
+                                        <?= htmlspecialchars($pr['assigned_pic']) ?> <?= !$pr['assigned_by_ai'] ? '(Manual)' : '' ?>
+                                    </span>
+                                <?php else: ?>
+                                    <span class="text-yellow-600 italic">Unassigned</span>
+                                <?php endif; ?>
+                                <svg class="ml-2 h-3 w-3 text-gray-400" fill="currentColor" viewBox="0 0 20 20"><path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zM11.379 5.793L3 14.172V17h2.828l8.38-8.379-2.83-2.828z"></path></svg>
+                            </button>
+                        </td>
+                        <td class="px-4 py-3 text-center">
+                            <input type="checkbox"
+                                   class="line-select-checkbox h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
+                                   data-ticket="<?= htmlspecialchars($pr['ticket_no']) ?>"
+                                   data-line="<?= htmlspecialchars($pr['ticket_line_item'] ?? '') ?>"
+                                   value="<?= htmlspecialchars($pr['ticket_no'] . '|' . ($pr['ticket_line_item'] ?? '')) ?>">
+                        </td>
+                    </tr>
+                    <?php endif; ?>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div id="reassignModal" class="fixed z-50 inset-0 hidden overflow-y-auto">
+  <div class="flex items-end justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
+    <div class="fixed inset-0 bg-gray-500 bg-opacity-75 transition-opacity backdrop-blur-sm" id="modalOverlay"></div>
+    <span class="hidden sm:inline-block sm:align-middle sm:h-screen">&#8203;</span>
+    <div class="inline-block align-bottom bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-md sm:w-full">
+      <form method="POST" action="">
+          <div class="bg-white px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
+            <div class="sm:flex sm:items-start">
+              <div class="mx-auto flex-shrink-0 flex items-center justify-center h-12 w-12 rounded-full bg-indigo-100 sm:mx-0 sm:h-10 sm:w-10">
+                <svg class="h-6 w-6 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" /></svg>
+              </div>
+              <div class="mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left w-full">
+                <h3 class="text-lg font-medium text-gray-900">Reassign PR Ticket</h3>
+                <div class="mt-2">
+                  <p class="text-sm text-gray-500 mb-1">Select a new PIC for ticket <strong id="modal-ticket-display" class="text-indigo-600"></strong>.</p>
+                  <p class="text-xs text-gray-400 mb-4" id="modal-lines-summary"></p>
+                  <input type="hidden" name="reassign_ticket_no" id="modal-ticket-input" value="">
+                  <span id="modal-lines-container"></span>
+                  <select name="new_pic" id="modal-pic-select" class="block w-full py-2 px-3 border border-gray-300 bg-white rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                      <option value="">-- Set to Unassigned --</option>
+                      <?php foreach ($all_pics as $pic): ?>
+                          <option value="<?= htmlspecialchars($pic) ?>"><?= htmlspecialchars($pic) ?></option>
+                      <?php endforeach; ?>
+                  </select>
+                  <?php if ($role === 'Category Manager'): ?>
+                  <div class="mt-3 flex items-start">
+                    <div class="flex items-center h-5">
+                      <input id="modal-update-master-data" name="update_master_data" type="checkbox" class="focus:ring-indigo-500 h-4 w-4 text-indigo-600 border-gray-300 rounded">
+                    </div>
+                    <div class="ml-3 text-sm">
+                      <label for="modal-update-master-data" class="font-medium text-gray-700">Update PIC in Master Data</label>
+                      <p class="text-gray-500 text-xs mt-1">Also update the mapped master data dictionary for these line items.</p>
+                    </div>
+                  </div>
+                  <?php endif; ?>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="bg-gray-50 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
+            <button type="submit" class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-indigo-600 text-base font-bold text-white hover:bg-indigo-700 sm:ml-3 sm:w-auto sm:text-sm">Save Changes</button>
+            <button type="button" id="closeModalBtn" class="mt-3 w-full inline-flex justify-center rounded-md border border-gray-300 shadow-sm px-4 py-2 bg-white text-base font-bold text-gray-700 hover:bg-gray-50 sm:mt-0 sm:ml-3 sm:w-auto sm:text-sm">Cancel</button>
+          </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- PROJECT ASSIGN MODAL (manual, eligible officers only, via ajax_project_assign.php) -->
+<div id="projectAssignModal" class="fixed z-50 inset-0 hidden overflow-y-auto">
+  <div class="flex items-end justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
+    <div class="fixed inset-0 bg-gray-500 bg-opacity-75 transition-opacity backdrop-blur-sm" id="projOverlay"></div>
+    <span class="hidden sm:inline-block sm:align-middle sm:h-screen">&#8203;</span>
+    <div class="inline-block align-bottom bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-md sm:w-full">
+        <div class="bg-white px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
+            <div class="sm:flex sm:items-start">
+              <div class="mx-auto flex-shrink-0 flex items-center justify-center h-12 w-12 rounded-full bg-indigo-100 sm:mx-0 sm:h-10 sm:w-10">
+                <svg class="h-6 w-6 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" /></svg>
+              </div>
+              <div class="mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left w-full">
+                <h3 class="text-lg font-medium text-gray-900">Assign Project Ticket</h3>
+                <div class="mt-2">
+                  <p class="text-sm text-gray-500 mb-1">Ticket <strong id="proj-modal-ticket" class="text-indigo-600"></strong></p>
+                  <p class="text-xs text-gray-400 mb-4">P.Group <strong id="proj-modal-pgroup"></strong> &middot; eligible officers only.</p>
+                  <select id="proj-officer-select" class="block w-full py-2 px-3 border border-gray-300 bg-white rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                      <option value="">-- Set to Unassigned --</option>
+                  </select>
+                  <p id="proj-modal-error" class="text-xs text-red-600 mt-2 hidden"></p>
+                </div>
+              </div>
+            </div>
+        </div>
+        <div class="bg-gray-50 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
+            <button type="button" id="projSaveBtn" class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-indigo-600 text-base font-bold text-white hover:bg-indigo-700 sm:ml-3 sm:w-auto sm:text-sm">Save Changes</button>
+            <button type="button" id="projCancelBtn" class="mt-3 w-full inline-flex justify-center rounded-md border border-gray-300 shadow-sm px-4 py-2 bg-white text-base font-bold text-gray-700 hover:bg-gray-50 sm:mt-0 sm:ml-3 sm:w-auto sm:text-sm">Cancel</button>
+        </div>
+    </div>
+  </div>
+</div>
+
+<div id="waModal" class="fixed z-50 inset-0 hidden overflow-y-auto">
+  <div class="flex items-center justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:p-0">
+    <div class="fixed inset-0 bg-gray-500 bg-opacity-75 transition-opacity backdrop-blur-sm" id="waModalOverlay"></div>
+    <div class="inline-block align-bottom bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-5xl sm:w-full">
+        <div class="bg-indigo-700 px-6 py-4">
+            <h3 class="text-xl font-bold text-white">Shoot Evaluation Reminders</h3>
+            <p class="text-indigo-200 text-sm mt-1">
+                Select POs, review the per-requestor summary, then send. Each requestor receives
+                <strong>one email and one WhatsApp</strong> covering all of their selected POs.
+            </p>
+        </div>
+
+        <div class="p-6">
+            <table id="waTable" class="min-w-full leading-normal w-full text-left">
+                <thead>
+                    <tr>
+                        <th class="px-4 py-3 bg-gray-100 border-b-2 border-gray-300 w-12 text-center">
+                            <input type="checkbox" id="wa-select-all" class="h-4 w-4 text-indigo-600 rounded">
+                        </th>
+                        <th class="px-4 py-3 bg-gray-100 border-b-2 border-gray-300 text-xs font-bold text-gray-600 uppercase">PO Number</th>
+                        <th class="px-4 py-3 bg-gray-100 border-b-2 border-gray-300 text-xs font-bold text-gray-600 uppercase">Vendor</th>
+                        <th class="px-4 py-3 bg-gray-100 border-b-2 border-gray-300 text-xs font-bold text-gray-600 uppercase">Requestor</th>
+                        <th class="px-4 py-3 bg-gray-100 border-b-2 border-gray-300 text-xs font-bold text-gray-600 uppercase">GR Date</th>
+                    </tr>
+                    <tr class="bg-gray-50">
+                        <th class="px-4 py-2"></th>
+                        <th class="px-4 py-2"><input type="text" class="wa-col-search w-full px-2 py-1 text-xs border rounded" placeholder="Filter PO..."></th>
+                        <th class="px-4 py-2"><input type="text" class="wa-col-search w-full px-2 py-1 text-xs border rounded" placeholder="Filter Vendor..."></th>
+                        <th class="px-4 py-2"><input type="text" class="wa-col-search w-full px-2 py-1 text-xs border rounded" placeholder="Filter Requestor..."></th>
+                        <th class="px-4 py-2"></th>
+                    </tr>
+                </thead>
+                <tbody id="wa-table-body">
+                    <?php if(!empty($pending_evals)): ?>
+                        <?php foreach($pending_evals as $eval): ?>
+                        <tr class="border-b border-gray-100 hover:bg-indigo-50 transition">
+                            <td class="px-4 py-3 text-center">
+                                <input type="checkbox" class="wa-checkbox h-4 w-4 text-indigo-600 rounded" value="<?= htmlspecialchars($eval['po_number']) ?>">
+                            </td>
+                            <td class="px-4 py-3 text-sm font-mono font-bold text-indigo-700"><?= htmlspecialchars($eval['po_number']) ?></td>
+                            <td class="px-4 py-3 text-sm text-gray-800"><?= htmlspecialchars($eval['vendor_name']) ?></td>
+                            <td class="px-4 py-3 text-sm text-gray-800 font-semibold"><?= htmlspecialchars($eval['requestor_name']) ?></td>
+                            <td class="px-4 py-3 text-xs text-gray-500"><?= htmlspecialchars(date('d M Y', strtotime($eval['gr_date']))) ?></td>
+                        </tr>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </tbody>
+            </table>
+
+            <!-- Populated by the server-side preview (SELECT only — nothing is sent). -->
+            <div id="wa-preview-panel" class="hidden mt-5 rounded-lg border border-gray-200 bg-gray-50 p-4">
+                <div class="flex items-center justify-between mb-2">
+                    <h4 class="text-sm font-bold text-gray-700">Recipients for this send</h4>
+                    <span id="wa-preview-headline" class="text-xs text-gray-500"></span>
+                </div>
+                <div id="wa-preview-body" class="max-h-56 overflow-y-auto text-xs text-gray-700"></div>
+                <div id="wa-preview-skips" class="mt-2 text-xs text-amber-700"></div>
+            </div>
+        </div>
+
+        <div class="bg-gray-50 px-6 py-4 border-t border-gray-200 flex flex-col gap-3">
+            <label id="wa-confirm-wrap" class="hidden flex items-start gap-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded-md p-3">
+                <input type="checkbox" id="wa-confirm-real-send" class="mt-0.5 h-4 w-4 text-red-600 rounded">
+                <span>I understand this will send an email and WhatsApp to the requestors listed above.</span>
+            </label>
+            <div class="flex flex-col sm:flex-row-reverse gap-3">
+                <button type="button" id="submit-wa-blast"
+                        class="w-full sm:w-auto inline-flex justify-center rounded-md border border-transparent shadow-sm px-6 py-2 bg-indigo-600 hover:bg-indigo-700 text-base font-bold text-white transition focus:outline-none">
+                    Review Recipients
+                </button>
+                <button type="button" id="closeWaModalBtn" class="w-full sm:w-auto inline-flex justify-center rounded-md border border-gray-300 shadow-sm px-6 py-2 bg-white text-base font-bold text-gray-700 hover:bg-gray-50 transition focus:outline-none">
+                    Cancel
+                </button>
+                <p id="wa-modal-hint" class="flex-1 self-center text-xs text-gray-600">
+                    Step 1 of 2 — nothing is sent until you review the recipients and confirm.
+                </p>
+            </div>
+        </div>
+    </div>
+  </div>
+</div>
+
+<!-- SweetAlert2 -->
+<script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+
+<script>
+// Eligible officers per Project p_group (drives the Project assign modal). Empty
+// object for the NONPROJECT persona, in which case no project rows/buttons exist.
+var officersByPgroup = <?= json_encode($officers_by_pgroup, JSON_UNESCAPED_UNICODE) ?>;
+
+// Vendor Evaluation v2 reminder sender. ajax_send_wa.php rejects a send that
+// carries neither token, so a cross-site POST cannot trigger a blast.
+var VE2_CSRF_TOKEN   = <?= json_encode(ve2_csrf_token()) ?>;
+var VE2_SEND_CONFIRM = <?= json_encode(VE2_WEB_SEND_CONFIRM) ?>;
+
+// Phase F-5 (Task B): per-team Non-Project PIC pools for the COMBINED reassign
+// modal. Empty for other personas, in which case the legacy options are kept.
+var npPicsByTeam     = <?= json_encode($np_pics_by_team, JSON_UNESCAPED_UNICODE) ?>;
+
+var dashboardPersona = <?= json_encode($persona) ?>;
+
+// Non-AJAX fallback only: if a reassignment POST redirected here (no JS at submit
+// time), replay its one-shot flash through the same feedback modal. null normally.
+var reassignFlash = <?= $reassign_flash ? json_encode($reassign_flash, JSON_UNESCAPED_UNICODE) : 'null' ?>;
+
+$(document).ready(function() {
+    var currentStatusFilter = ''; // '', 'Outstanding', 'On Progress', 'PO Created', 'manual-only'
+    var currentTypeFilter = '';   // '', 'intercompany', 'non-intercompany'
+    var currentTeamFilter = '';   // '', 'np:<CODE>', or a Project group number (string)
+
+    // ===== REUSABLE FEEDBACK MODAL ==========================================
+    // One modal drives every reassignment outcome: success, server/validation
+    // error, network error, and the mixed-ticket warning. Defined and wired up
+    // FIRST — before DataTables/chart init — so "Got it" can always dismiss it
+    // even if a later init step throws. Message text is written with .text() only.
+    var $feedbackModal = $('#reassignFeedbackModal');
+    function showReassignFeedbackModal(type, title, message) {
+        var $wrap = $('#reassignFeedbackIconWrap');
+        var $icon = $('#reassignFeedbackIcon');
+        var $btn  = $('#reassignFeedbackClose');
+        $wrap.removeClass('bg-green-100 bg-red-100 bg-amber-100');
+        $icon.removeClass('text-green-600 text-red-600 text-amber-600');
+        $btn.removeClass('bg-green-600 hover:bg-green-700 bg-red-600 hover:bg-red-700 bg-amber-500 hover:bg-amber-600');
+        if (type === 'success') {
+            $wrap.addClass('bg-green-100'); $icon.addClass('text-green-600');
+            $btn.addClass('bg-green-600 hover:bg-green-700');
+            $('#reassignFeedbackIconPath').attr('d', 'M5 13l4 4L19 7');
+        } else if (type === 'warning') {
+            $wrap.addClass('bg-amber-100'); $icon.addClass('text-amber-600');
+            $btn.addClass('bg-amber-500 hover:bg-amber-600');
+            $('#reassignFeedbackIconPath').attr('d', 'M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z');
+        } else {
+            $wrap.addClass('bg-red-100'); $icon.addClass('text-red-600');
+            $btn.addClass('bg-red-600 hover:bg-red-700');
+            $('#reassignFeedbackIconPath').attr('d', 'M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z');
+        }
+        $('#reassignFeedbackTitle').text(title || '');
+        $('#reassignFeedbackMessage').text(message || '');
+        $feedbackModal.removeClass('hidden');
+    }
+    // Close handlers bound exactly once. "Got it" and the overlay both dismiss it;
+    // dismissing only hides (never reloads), so it stays gone until re-triggered.
+    $('#reassignFeedbackClose, #reassignFeedbackOverlay').on('click', function() {
+        $feedbackModal.addClass('hidden');
+    });
+    // Non-AJAX fallback: a redirect-carried flash shows through the same modal.
+    if (reassignFlash && reassignFlash.message) {
+        var flashOk = (reassignFlash.type === 'success');
+        showReassignFeedbackModal(flashOk ? 'success' : 'error',
+            flashOk ? 'Reassignment Successful' : 'Reassignment Failed',
+            reassignFlash.message);
+    }
+
+    // dom 'rtip' drops the built-in search box (our toolbar #globalSearch drives it)
+    // and the length selector; default page length stays 25. Pagination preserved.
+    var table = $('#prTable').DataTable({
+        "pageLength": 25,
+        "order": [[ 1, "desc" ]],
+        "dom": 'rtip',
+        "orderCellsTop": true,
+        "deferRender": true,
+        "columnDefs": [{ "orderable": false, "targets": 9 }]
+    });
+
+    // Rows are paginated by DataTables now — drop the table loading skeleton.
+    $('.viz-table-loader').fadeOut(200);
+
+    // Define custom search function
+    $.fn.dataTable.ext.search.push(function(settings, data, dataIndex) {
+        var row = $(settings.aoData[dataIndex].nTr);
+
+        // 1. Status Filter
+        if (currentStatusFilter === 'manual-only') {
+            var assignedByAi = parseInt(row.attr('data-assigned-by-ai'));
+            if (assignedByAi !== 0) {
+                return false;
+            }
+        } else if (currentStatusFilter) {
+            var statusVal = data[6] ? data[6].trim() : '';
+            if (statusVal !== currentStatusFilter) {
+                return false;
+            }
+        }
+
+        // 2. Type Filter
+        var typeVal = (row.attr('data-ticket-type') || '').toLowerCase().trim();
+        var isIntercompany = (typeVal === 'intercompany' || typeVal === 'intercompany new store');
+        if (currentTypeFilter === 'intercompany') {
+            if (!isIntercompany) {
+                return false;
+            }
+        } else if (currentTypeFilter === 'non-intercompany') {
+            if (isIntercompany) {
+                return false;
+            }
+        }
+
+        // 2b. Team filter (Non-Project team acronyms + Project group numbers)
+        if (currentTeamFilter.indexOf('np:') === 0) {
+            var wantTeam = currentTeamFilter.slice(3);
+            if ((row.attr('data-row-type') || '') !== 'nonproject') {
+                return false;
+            }
+            var assignedPic = row.attr('data-assigned-pic') || '';
+            
+            // Find which team the assigned PIC belongs to, if any
+            var picActualTeam = null;
+            for (var t in npPicsByTeam) {
+                if (npPicsByTeam[t] && npPicsByTeam[t].indexOf(assignedPic) !== -1) {
+                    picActualTeam = t;
+                    break;
+                }
+            }
+
+            if (picActualTeam) {
+                // If the PIC is mapped to a team, the row belongs ONLY to that team
+                if (picActualTeam !== wantTeam) {
+                    return false;
+                }
+            } else {
+                // PIC is not mapped to any specific team (e.g. 'Unassigned', '', or an acronym like 'CSGSM')
+                // So it belongs to wantTeam if assignedPic == wantTeam OR data-team == wantTeam
+                if (assignedPic !== wantTeam && (row.attr('data-team') || '') !== wantTeam) {
+                    return false;
+                }
+            }
+        } else if (currentTeamFilter) {
+            if ((row.attr('data-group') || '') !== currentTeamFilter) {
+                return false;
+            }
+        }
+
+        return true;
+    });
+
+    $('.status-filter-btn').on('click', function() {
+        $('.status-filter-btn').removeClass('bg-indigo-600 bg-red-600 bg-yellow-500 bg-green-600 bg-violet-600 text-white border-indigo-600 border-red-600 border-yellow-500 border-green-600 border-violet-600 shadow-md ring-2 ring-offset-2').addClass('bg-white text-gray-700 border-gray-200');
+        
+        var status = $(this).data('status');
+        var filter = $(this).data('filter');
+        
+        if (filter === 'manual-only') {
+            currentStatusFilter = 'manual-only';
+            $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-violet-600 text-white border-violet-600 shadow-md ring-2 ring-offset-2');
+        } else {
+            currentStatusFilter = status || '';
+            if (status === 'Outstanding') {
+                $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-red-600 text-white border-red-600 shadow-md ring-2 ring-offset-2');
+            } else if (status === 'On Progress') {
+                $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-yellow-500 text-white border-yellow-500 shadow-md ring-2 ring-offset-2');
+            } else if (status === 'PO Created') {
+                $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-green-600 text-white border-green-600 shadow-md ring-2 ring-offset-2');
+            } else {
+                currentStatusFilter = '';
+                $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-indigo-600 text-white border-indigo-600 shadow-md ring-2 ring-offset-2');
+            }
+        }
+        table.draw();
+    });
+
+    $('.type-filter-btn').on('click', function() {
+        $('.type-filter-btn').removeClass('bg-indigo-600 bg-teal-600 bg-blue-600 text-white border-indigo-600 border-teal-600 border-blue-600 shadow-md ring-2 ring-offset-2').addClass('bg-white text-gray-700 border-gray-200');
+        
+        var type = $(this).data('type');
+        currentTypeFilter = type || '';
+        
+        if (type === 'intercompany') {
+            $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-teal-600 text-white border-teal-600 shadow-md ring-2 ring-offset-2');
+        } else if (type === 'non-intercompany') {
+            $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-blue-600 text-white border-blue-600 shadow-md ring-2 ring-offset-2');
+        } else {
+            currentTypeFilter = '';
+            $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-indigo-600 text-white border-indigo-600 shadow-md ring-2 ring-offset-2');
+        }
+        table.draw();
+    });
+
+    $('.team-filter-btn').on('click', function() {
+        $('.team-filter-btn').removeClass('bg-indigo-600 text-white border-indigo-600 ring-2 ring-offset-2').addClass('bg-white text-gray-700 border-gray-200');
+        $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-indigo-600 text-white border-indigo-600 ring-2 ring-offset-2');
+        var grp = $(this).data('group');
+        var npteam = $(this).data('npteam');
+        if (npteam !== undefined && npteam !== '') {
+            currentTeamFilter = 'np:' + npteam;
+        } else if (grp === '' || grp === undefined) {
+            currentTeamFilter = '';
+        } else {
+            currentTeamFilter = String(grp);
+        }
+        table.draw();
+    });
+
+    $('.column-search-text').on('keyup change clear', function(e) {
+        e.stopPropagation();
+        table.column($(this).data('col')).search(this.value).draw();
+    });
+
+    // --- TOOLBAR: global search (drives DataTables' built-in search) ---
+    $('#globalSearch').on('keyup change', function() {
+        table.search(this.value).draw();
+    });
+
+    $('.filter-trigger').on('click', function(e) {
+        e.stopPropagation();
+        var $dropdown = $(this).next('.filter-dropdown');
+        $('.filter-dropdown').not($dropdown).addClass('hidden');
+        $dropdown.toggleClass('hidden');
+    });
+
+    $(document).on('click', function() { $('.filter-dropdown').addClass('hidden'); });
+    $('.filter-dropdown').on('click', function(e) { e.stopPropagation(); });
+
+    $('.dropdown-search').on('keyup', function() {
+        var searchTerm = $(this).val().toLowerCase();
+        var $list = $(this).closest('.filter-dropdown').find('.checkbox-list label');
+        $list.each(function() {
+            var text = $(this).text().toLowerCase();
+            $(this).toggle(text.indexOf(searchTerm) > -1);
+        });
+    });
+
+    $('.select-all-checkbox').on('change', function() {
+        var isChecked = $(this).prop('checked');
+        $(this).closest('.filter-dropdown').find('.checkbox-list label:visible .col-checkbox').prop('checked', isChecked);
+    });
+
+    $('.apply-filter').on('click', function() {
+        var colIdx = $(this).data('col');
+        var $dropdown = $(this).closest('.filter-dropdown');
+        var selected = [];
+        $dropdown.find('.col-checkbox:checked').each(function() { selected.push($.fn.dataTable.util.escapeRegex($(this).val())); });
+
+        var $triggerLabel = $(this).closest('.col-filter').find('.col-trigger-label');
+        if (selected.length === 0) {
+            table.column(colIdx).search('', false, false).draw();
+            if ($triggerLabel.length) $triggerLabel.text('All');
+        } else {
+            table.column(colIdx).search('^(' + selected.join('|') + ')$', true, false).draw();
+            if ($triggerLabel.length) $triggerLabel.text(selected.length === 1 ? '1 Selected' : selected.length + ' Selected');
+        }
+        $dropdown.addClass('hidden');
+    });
+
+    $('.clear-filter').on('click', function() {
+        var $dropdown = $(this).closest('.filter-dropdown');
+        var colIdx = $dropdown.find('.apply-filter').data('col');
+        $dropdown.find('.col-checkbox, .select-all-checkbox').prop('checked', false);
+        $dropdown.find('.dropdown-search').val('').trigger('keyup');
+        table.column(colIdx).search('', false, false).draw();
+        
+        var $triggerLabel = $(this).closest('.col-filter').find('.col-trigger-label');
+        if ($triggerLabel.length) $triggerLabel.text('All');
+        
+        $dropdown.addClass('hidden');
+    });
+
+    // Copy Ticket No to clipboard
+    $('#prTable tbody').on('click', '.ticket-no-cell', function(e) {
+        // Prevent click from triggering row selection
+        if ($(e.target).closest('input[type="checkbox"]').length) return;
+        
+        var ticketNo = $(this).find('.ticket-no-text').text().trim();
+        var $toast = $(this).find('.copy-toast');
+        
+        navigator.clipboard.writeText(ticketNo).then(function() {
+            $toast.removeClass('opacity-0').addClass('opacity-100 -translate-y-2');
+            setTimeout(function() {
+                $toast.removeClass('opacity-100 -translate-y-2').addClass('opacity-0');
+            }, 1500);
+        });
+    });
+
+    const modal = $('#reassignModal');
+    var reassignSelectedLines = [];  // prs.ticket_line_item values for the pending reassignment
+
+    // Populate the PIC dropdown. Category Managers can reassign to anyone (cross-team).
+    // The dropdown is pre-populated in HTML with $all_pics.
+    function populateReassignPicPool(teamCode, currentPic) {
+        var $sel = $('#modal-pic-select');
+        $sel.val(currentPic);
+    }
+
+    // Open the reassign modal for a single ticket and an explicit list of line items.
+    function openReassignModal(ticket, lines, currentPic, teamCode) {
+        reassignSelectedLines = (lines || []).slice();
+        $('#modal-ticket-display').text(ticket);
+        $('#modal-ticket-input').val(ticket);
+        var n = reassignSelectedLines.length;
+        $('#modal-lines-summary').text(
+            n === 1 ? ('Line item: ' + reassignSelectedLines[0])
+                    : (n + ' line items selected — unselected lines of this ticket stay unchanged')
+        );
+        populateReassignPicPool(teamCode, currentPic || '');
+        modal.removeClass('hidden');
+    }
+
+    // Single-line reassign via the per-row Assigned-PIC button.
+    $('#prTable tbody').on('click', '.open-modal-btn', function() {
+        var ticket = $(this).data('ticket');
+        var line = String($(this).data('line'));
+        var currentPic = $(this).data('pic') || '';
+        var teamCode = $(this).closest('tr').attr('data-team') || '';
+        openReassignModal(ticket, [line], currentPic, teamCode);
+    });
+    $('#closeModalBtn, #modalOverlay').on('click', function() { modal.addClass('hidden'); });
+
+    // Update the visible rows the server just reassigned, in place — no reload, no
+    // DataTables redraw, so the current filter/search/page/order/scroll all survive.
+    // Rows are matched by ticket_no + ticket_line_item via each row's checkbox. Rows
+    // hidden by the current filter/page simply aren't found; the DB already changed.
+    function applyReassignSuccess(data) {
+        var ticket = String(data.ticket_no);
+        var lines = data.lines || [];
+        var assignedPic = data.assigned_pic || '';   // '' / null => Unassigned
+        var isUnassigned = !assignedPic;
+
+        lines.forEach(function(line) {
+            var lineStr = String(line);
+            $('#prTable tbody .line-select-checkbox').each(function() {
+                var $cb = $(this);
+                if (String($cb.data('ticket')) !== ticket) { return; }
+                if (String($cb.data('line')) !== lineStr) { return; }
+                var $row = $cb.closest('tr');
+
+                // Assigned PIC cell (col 8): swap only the label span; keep the pencil
+                // svg intact. Manual reassignment always sets assigned_by_ai = 0.
+                var $btn = $row.find('.open-modal-btn');
+                $btn.attr('data-pic', assignedPic).data('pic', assignedPic);
+                var $label = $('<span>');
+                if (isUnassigned) {
+                    $label.addClass('text-yellow-600 italic').text('Unassigned');
+                } else {
+                    $label.addClass('text-indigo-700 font-semibold').text(assignedPic + ' (Manual)');
+                }
+                $btn.find('span').first().replaceWith($label);
+                $row.attr('data-assigned-by-ai', '0');
+
+                // Keep the column filter/search cache in sync (drives the Assigned PIC
+                // dropdown filter + global search) without forcing a redraw.
+                var $td = $btn.closest('td').attr('data-search', isUnassigned ? 'Unassigned' : assignedPic);
+                try { table.cell($td.get(0)).invalidate('dom'); } catch (err) {}
+
+                // Clear just this reassigned line's checkbox; drop it as the anchor.
+                $cb.prop('checked', false);
+                if (lastCheckedBox === $cb.get(0)) { lastCheckedBox = null; }
+            });
+        });
+        refreshLineSelectBar();
+    }
+
+    // Reassignment submit -> AJAX (the normal path). preventDefault so the page never
+    // reloads; the server returns JSON and we update the affected rows in place.
+    var reassignSubmitting = false;
+    modal.find('form').on('submit', function(e) {
+        e.preventDefault();
+        if (reassignSubmitting) { return; }
+
+        var ticket = $('#modal-ticket-input').val();
+        var newPic = $('#modal-pic-select').val();
+        var lines = reassignSelectedLines.slice();
+        // Mirror the server no-op guard: never submit an empty selection.
+        if (!ticket || lines.length === 0) {
+            modal.addClass('hidden');
+            showReassignFeedbackModal('error', 'Reassignment Failed', 'No valid line items were selected for this ticket.');
+            return;
+        }
+
+        var fd = new FormData();
+        fd.append('reassign_ticket_no', ticket);
+        fd.append('new_pic', newPic);
+        fd.append('update_master_data', $('#modal-update-master-data').is(':checked') ? '1' : '0');
+        lines.forEach(function(li) { fd.append('reassign_lines[]', li); });
+
+        var $submitBtn = modal.find('button[type="submit"]');
+        reassignSubmitting = true;
+        $submitBtn.prop('disabled', true).text('Reassigning…');
+
+        fetch('dashboard_mgr.php', {
+            method: 'POST',
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' },
+            body: fd
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(resp) {
+            modal.addClass('hidden');
+            if (resp && resp.ok) {
+                applyReassignSuccess(resp);
+                showReassignFeedbackModal('success', 'Reassignment Successful',
+                    resp.message || 'Reassignment successful.');
+            } else {
+                showReassignFeedbackModal('error', 'Reassignment Failed',
+                    (resp && resp.message) ? resp.message : 'Reassignment failed. Please try again.');
+            }
+        })
+        .catch(function() {
+            modal.addClass('hidden');
+            showReassignFeedbackModal('error', 'Reassignment Failed',
+                'A network error occurred and no changes were saved. Please try again.');
+        })
+        .then(function() {
+            reassignSubmitting = false;
+            $submitBtn.prop('disabled', false).text('Save Changes');
+        });
+    });
+
+    // ===== LINE SELECTION UX (keyboard-assisted; visible rows only) =========
+    // Selection is scoped to the rows DataTables currently renders (current page +
+    // active search/sort). Cross-page persistence is intentionally NOT supported,
+    // so the action-bar count always matches exactly what a reassignment submits.
+    var lastCheckedBox = null;   // anchor <input> for shift-range selection
+    var lineNoteTimer  = null;
+
+    // Currently-rendered checked boxes — also the exact set the submit uses, so the
+    // count can never be misleading.
+    function selectedLineCheckboxes() { return $('#prTable tbody').find('.line-select-checkbox:checked'); }
+
+    function showLineSelectNote(msg) {
+        var $note = $('#lineSelectNote').text(msg).removeClass('hidden');
+        if (lineNoteTimer) { clearTimeout(lineNoteTimer); }
+        lineNoteTimer = setTimeout(function() { $note.addClass('hidden').text(''); }, 4500);
+    }
+
+    function refreshLineSelectBar() {
+        // Re-sync every visible row's highlight from its checkbox, then the bar.
+        $('#prTable tbody tr').each(function() {
+            var $cb = $(this).find('.line-select-checkbox');
+            $(this).toggleClass('line-row-selected', $cb.length > 0 && $cb.prop('checked'));
+        });
+        var count = selectedLineCheckboxes().length;
+        $('#lineSelectCount').text(count);
+        $('#lineSelectBar').toggleClass('hidden', count === 0);
+        
+        var visibleCheckboxes = table.$('.line-select-checkbox', {filter: 'applied'});
+        var checkedVisible = visibleCheckboxes.filter(':checked');
+        if (visibleCheckboxes.length > 0 && visibleCheckboxes.length === checkedVisible.length) {
+            $('#selectAllCheckbox').prop('checked', true);
+        } else {
+            $('#selectAllCheckbox').prop('checked', false);
+        }
+    }
+
+    // Shift-range: check the visible rows between the anchor and the clicked box,
+    // but ONLY those sharing the anchor's ticket. Returns true if the raw range
+    // spanned more than one ticket (so the caller can warn). Never selects across
+    // tickets, so a shift-drag cannot build a multi-ticket reassignment.
+    function applyShiftRange($target) {
+        var $boxes = $('#prTable tbody tr').find('.line-select-checkbox');
+        var start = lastCheckedBox ? $boxes.index(lastCheckedBox) : -1;
+        var end   = $boxes.index($target.get(0));
+        if (start === -1 || end === -1) { return false; }
+        if (start > end) { var tmp = start; start = end; end = tmp; }
+        var anchorTicket = String($(lastCheckedBox).data('ticket'));
+        var crossed = false;
+        $boxes.slice(start, end + 1).each(function() {
+            if (String($(this).data('ticket')) === anchorTicket) {
+                $(this).prop('checked', true);
+            } else {
+                crossed = true;
+            }
+        });
+        return crossed;
+    }
+
+    // Shift-click path, shared by checkbox and row clicks. Ranges always run from the
+    // existing anchor to $cb; if there is no anchor yet, the clicked line becomes the
+    // anchor and only that line is affected (nothing to range against).
+    // alreadyToggled=true when the browser already flipped $cb's own checked state
+    // (native checkbox click); false when we must set it ourselves (row click never
+    // natively toggles anything).
+    function applyShiftSelection($cb, alreadyToggled) {
+        if (!lastCheckedBox) {
+            if (!alreadyToggled) {
+                $cb.prop('checked', !$cb.prop('checked'));
+            }
+            lastCheckedBox = $cb.get(0);
+            return;
+        }
+        $cb.prop('checked', true); // the range end (or the anchor itself) is always selected
+        if ($cb.get(0) !== lastCheckedBox) {
+            var crossed = applyShiftRange($cb);
+            if (crossed) {
+                showLineSelectNote('Range limited to one ticket.');
+            }
+        }
+        lastCheckedBox = $cb.get(0);
+    }
+
+    // Direct checkbox click (also covers the spacebar toggle, which fires 'click').
+    // The browser has already flipped the checked state by the time this runs.
+    $('#prTable tbody').on('click', '.line-select-checkbox', function(e) {
+        var $cb = $(this);
+        if (e.shiftKey) {
+            applyShiftSelection($cb, true);
+        } else {
+            // Plain click or Ctrl/Cmd-click: native toggle already happened, both just
+            // move the anchor here.
+            lastCheckedBox = $cb.get(0);
+        }
+        refreshLineSelectBar();
+    });
+
+    $('#selectAllCheckbox').on('click', function(e) {
+        var isChecked = $(this).prop('checked');
+        // Only select the checkboxes currently filtered/displayed
+        table.$('.line-select-checkbox', {filter: 'applied'}).prop('checked', isChecked);
+        refreshLineSelectBar();
+    });
+
+    // Belt-and-suspenders for the CSS user-select:none above: Shift/Ctrl/Cmd-click is a
+    // click-drag-like gesture browsers also read as "extend the text selection", which
+    // can still kick in on mousedown regardless of user-select in some browsers. Stop it
+    // at the source, before the browser starts a selection, while leaving interactive
+    // controls (button/link/select/input/label/svg) untouched so they keep working.
+    $('#prTable tbody').on('mousedown', 'tr', function(e) {
+        if ($(e.target).closest('button, a, select, input, label, svg').length) { return; }
+        if (e.shiftKey || e.ctrlKey || e.metaKey) {
+            e.preventDefault();
+        }
+    });
+
+    // Row click is deliberately inert on its own — a plain click must never select a
+    // line, it's too easy to trigger by accident. Only Ctrl/Cmd-click (toggle + set
+    // anchor) and Shift-click (range from the anchor) act. Clicks on interactive
+    // controls (button/link/select/input/label/svg), including the checkbox itself
+    // (handled above), and project rows (no checkbox) are ignored.
+    $('#prTable tbody').on('click', 'tr', function(e) {
+        if ($(e.target).closest('button, a, select, input, label, svg').length) { return; }
+        var $cb = $(this).find('.line-select-checkbox');
+        if ($cb.length === 0) { return; }
+
+        if (e.shiftKey) {
+            applyShiftSelection($cb, false);
+        } else if (e.ctrlKey || e.metaKey) {
+            $cb.prop('checked', !$cb.prop('checked'));
+            lastCheckedBox = $cb.get(0);
+        } else {
+            return; // plain row click: no selection change
+        }
+        refreshLineSelectBar();
+    });
+
+    // Filter / sort / page changes re-render the tbody, which can drop the anchor's
+    // row node entirely — drop the stale reference too so it's never dereferenced.
+    table.on('draw', function() {
+        if (lastCheckedBox && $.inArray(lastCheckedBox, $('#prTable tbody tr').find('.line-select-checkbox').get()) === -1) {
+            lastCheckedBox = null;
+        }
+        refreshLineSelectBar();
+    });
+
+    $('#lineSelectClear').on('click', function() {
+        // Clear across all rows (including any off-page nodes) to fully reset.
+        table.$('.line-select-checkbox').prop('checked', false);
+        $('#selectAllCheckbox').prop('checked', false);
+        table.$('tr').removeClass('line-row-selected');
+        lastCheckedBox = null;
+        refreshLineSelectBar();
+    });
+    $('#reassignSelectedBtn').on('click', function() {
+        var $checked = selectedLineCheckboxes();
+        if ($checked.length === 0) { return; }
+        // Enforce a single ticket per operation (mirrors the RFQ line-selection rule).
+        var ticket = String($checked.first().data('ticket'));
+        var sameTicket = true, lines = [], teamCode = '';
+        $checked.each(function() {
+            if (String($(this).data('ticket')) !== ticket) { sameTicket = false; }
+            lines.push(String($(this).data('line')));
+            if (!teamCode) { teamCode = $(this).closest('tr').attr('data-team') || ''; }
+        });
+        if (!sameTicket) {
+            // Styled warning (not a native alert): no reload, filters/selection kept,
+            // nothing submitted — the user can fix the selection and try again.
+            showReassignFeedbackModal('warning', 'Select One Ticket',
+                'Please select line items from one ticket only before reassigning.');
+            return;
+        }
+        openReassignModal(ticket, lines, '', teamCode);
+    });
+
+    // --- PROJECT ASSIGN MODAL (manual, scoped ticket_no + p_group, no AI) ---
+    // Routes to ajax_project_assign.php, NOT the Non-Project reassign POST. That
+    // endpoint re-validates head access, p_group scope, officer eligibility and
+    // keeps Intercompany rows read-only.
+    var projModal = $('#projectAssignModal');
+    var projTicket = '', projPgroup = '';
+    $('#prTable tbody').on('click', '.project-assign-btn', function() {
+        projTicket = $(this).data('ticket');
+        projPgroup = String($(this).data('pgroup'));
+        var currentOfficer = $(this).data('officer') || '';
+        $('#proj-modal-ticket').text(projTicket);
+        $('#proj-modal-pgroup').text(projPgroup);
+        $('#proj-modal-error').addClass('hidden').text('');
+        var $sel = $('#proj-officer-select');
+        $sel.empty().append('<option value="">-- Set to Unassigned --</option>');
+        (officersByPgroup[projPgroup] || []).forEach(function(name) {
+            $sel.append($('<option>').val(name).text(name));
+        });
+        $sel.val(currentOfficer);
+        projModal.removeClass('hidden');
+    });
+    $('#projCancelBtn, #projOverlay').on('click', function() { projModal.addClass('hidden'); });
+    $('#projSaveBtn').on('click', function() {
+        var btn = $(this);
+        var newOfficer = $('#proj-officer-select').val();
+        btn.prop('disabled', true).text('Saving...');
+        $.ajax({
+            url: 'ajax_project_assign.php',
+            type: 'POST',
+            dataType: 'json',
+            data: { ticket_no: projTicket, p_group: projPgroup, new_officer: newOfficer },
+            success: function(resp) {
+                if (resp.status === 'success') {
+                    location.reload();
+                } else {
+                    $('#proj-modal-error').removeClass('hidden').text(resp.message || 'Assignment failed.');
+                    btn.prop('disabled', false).text('Save Changes');
+                }
+            },
+            error: function() {
+                $('#proj-modal-error').removeClass('hidden').text('Connection error. Please try again.');
+                btn.prop('disabled', false).text('Save Changes');
+            }
+        });
+    });
+
+    $('#prTable tbody').on('click', '.pr-taxonomy-clickable', function() {
+        var ticketNo = $(this).data('ticket-no');
+        Swal.fire({
+            title: 'Fetching Taxonomy...',
+            allowOutsideClick: false,
+            didOpen: () => { Swal.showLoading(); }
+        });
+        $.ajax({
+            url: 'ajax_get_pr_taxonomy.php',
+            type: 'POST',
+            data: { ticket_no: ticketNo },
+            dataType: 'json',
+            success: function(resp) {
+                if (resp.status === 'success') {
+                    var items = resp.data.line_items;
+                    var mdList = resp.data.master_data_list;
+                    
+                    var mdOptions = '<option value="">-- Select Existing Taxonomy --</option>';
+                    mdList.forEach(function(md) {
+                        mdOptions += '<option value="'+md.id+'">'+(md.level_4 || md.level_3 || md.level_2 || 'Unnamed')+' (ID: '+md.id+')</option>';
+                    });
+
+                    var html = '<div class="text-left w-full overflow-x-auto" style="max-height: 70vh;">';
+                    html += '<h3 class="font-bold text-lg mb-4 text-center">Ticket ' + ticketNo + '</h3>';
+                    
+                    items.forEach(function(item) {
+                        html += '<div class="bg-gray-50 p-4 rounded border border-gray-200 mb-4" id="row-'+item.ticket_line_item+'">';
+                        html += '<div class="flex justify-between items-start mb-2">';
+                        html += '<h4 class="font-semibold text-gray-800 text-sm">Line ' + item.ticket_line_item + ': ' + (item.item_description || '-') + '</h4>';
+                        html += '<button type="button" class="text-xs bg-indigo-100 text-indigo-700 px-2 py-1 rounded hover:bg-indigo-200" onclick="toggleEdit(\''+item.ticket_line_item+'\')">Edit</button>';
+                        html += '</div>';
+                        
+                        html += '<div id="view-'+item.ticket_line_item+'" class="space-y-1 text-xs">';
+                        html += '<p><span class="font-bold text-gray-500 w-16 inline-block">ID:</span> ' + (item.master_data_id || 'Unmapped') + '</p>';
+                        html += '<p><span class="font-bold text-gray-500 w-16 inline-block">L0:</span> ' + (item.level_0 || '-') + '</p>';
+                        html += '<p><span class="font-bold text-gray-500 w-16 inline-block">L1:</span> ' + (item.level_1 || '-') + '</p>';
+                        html += '<p><span class="font-bold text-gray-500 w-16 inline-block">L2:</span> ' + (item.level_2 || '-') + '</p>';
+                        html += '<p><span class="font-bold text-gray-500 w-16 inline-block">L3:</span> ' + (item.level_3 || '-') + '</p>';
+                        html += '<p><span class="font-bold text-gray-500 w-16 inline-block">L4:</span> ' + (item.level_4 || '-') + '</p>';
+                        html += '<p><span class="font-bold text-gray-500 w-16 inline-block">PIC:</span> ' + (item.assigned_pic || '-') + '</p>';
+                        html += '</div>';
+
+                        html += '<div id="edit-'+item.ticket_line_item+'" class="hidden mt-3 p-3 bg-white border border-gray-200 rounded text-sm">';
+                        html += '<div class="mb-3">';
+                        html += '<label class="block text-xs font-bold text-gray-700 mb-1">Select Existing Master Data</label>';
+                        html += '<select id="existing-'+item.ticket_line_item+'" class="w-full border-gray-300 rounded shadow-sm focus:border-indigo-500 focus:ring-indigo-500 text-xs p-2 border">' + mdOptions + '</select>';
+                        html += '</div>';
+                        
+                        html += '<div class="text-center text-xs text-gray-500 my-2">- OR CREATE NEW -</div>';
+                        
+                        html += '<div class="space-y-2">';
+                        html += '<input type="text" id="new-l0-'+item.ticket_line_item+'" placeholder="Level 0" class="w-full border-gray-300 rounded shadow-sm text-xs p-2 border">';
+                        html += '<input type="text" id="new-l1-'+item.ticket_line_item+'" placeholder="Level 1" class="w-full border-gray-300 rounded shadow-sm text-xs p-2 border">';
+                        html += '<input type="text" id="new-l2-'+item.ticket_line_item+'" placeholder="Level 2" class="w-full border-gray-300 rounded shadow-sm text-xs p-2 border">';
+                        html += '<input type="text" id="new-l3-'+item.ticket_line_item+'" placeholder="Level 3" class="w-full border-gray-300 rounded shadow-sm text-xs p-2 border">';
+                        html += '<input type="text" id="new-l4-'+item.ticket_line_item+'" placeholder="Level 4 (Required for new)" class="w-full border-gray-300 rounded shadow-sm text-xs p-2 border">';
+                        
+                        var picOptions = '<option value="">-- Select PIC --</option>';
+                        if (resp.data.pic_list) {
+                            resp.data.pic_list.forEach(function(pic) {
+                                picOptions += '<option value="'+pic+'">'+pic+'</option>';
+                            });
+                        }
+                        
+                        html += '<select id="new-pic-'+item.ticket_line_item+'" class="w-full border-gray-300 rounded shadow-sm text-xs p-2 border select2-pic">' + picOptions + '</select>';
+                        html += '<div class="flex justify-end mt-2">';
+                        html += '<button type="button" class="text-xs bg-indigo-600 text-white px-3 py-1.5 rounded hover:bg-indigo-700" onclick="saveTaxonomy(event, \''+ticketNo+'\', \''+item.ticket_line_item+'\')">Save</button>';
+                        html += '</div>';
+                        html += '</div>';
+                        
+                        html += '</div>'; // end edit div
+                        html += '</div>'; // end row wrapper
+                    });
+                    
+                    html += '</div>';
+                    
+                    Swal.fire({
+                        title: '',
+                        html: html,
+                        width: '800px',
+                        showConfirmButton: false,
+                        showCloseButton: true
+                    });
+                    
+                    window.toggleEdit = function(line) {
+                        $('#view-'+line).toggleClass('hidden');
+                        var editBox = $('#edit-'+line);
+                        editBox.toggleClass('hidden');
+                        
+                        if (!editBox.hasClass('hidden')) {
+                            $('#new-pic-'+line).select2({
+                                dropdownParent: $('.swal2-container'),
+                                placeholder: "-- Select PIC --",
+                                width: '100%'
+                            });
+                            $('#existing-'+line).select2({
+                                dropdownParent: $('.swal2-container'),
+                                placeholder: "-- Select Existing Taxonomy --",
+                                width: '100%'
+                            });
+                        }
+                    };
+                    
+                    window.saveTaxonomy = function(event, tNo, line) {
+                        var existingId = $('#existing-'+line).val();
+                        var data = { ticket_no: tNo, ticket_line_item: line };
+                        
+                        if (existingId) {
+                            data.mode = 'existing';
+                            data.master_data_id = existingId;
+                        } else {
+                            data.mode = 'new';
+                            data.level_0 = $('#new-l0-'+line).val();
+                            data.level_1 = $('#new-l1-'+line).val();
+                            data.level_2 = $('#new-l2-'+line).val();
+                            data.level_3 = $('#new-l3-'+line).val();
+                            data.level_4 = $('#new-l4-'+line).val();
+                            data.pic_names = $('#new-pic-'+line).val();
+                            
+                            if (!data.level_4) {
+                                Swal.showValidationMessage('Level 4 is required for new taxonomy');
+                                return;
+                            }
+                        }
+                        
+                        var btn = $(event.target);
+                        btn.prop('disabled', true).text('Saving...');
+                        
+                        $.ajax({
+                            url: 'ajax_update_pr_taxonomy.php',
+                            type: 'POST',
+                            data: data,
+                            dataType: 'json',
+                            success: function(res) {
+                                if (res.status === 'success') {
+                                    btn.removeClass('bg-indigo-600 hover:bg-indigo-700').addClass('bg-green-600 hover:bg-green-700').text('Saved!');
+                                    setTimeout(() => toggleEdit(line), 500);
+                                    
+                                    Swal.fire({
+                                        toast: true,
+                                        position: 'top-end',
+                                        icon: 'success',
+                                        title: 'Saved successfully',
+                                        showConfirmButton: false,
+                                        timer: 3000
+                                    });
+                                } else {
+                                    btn.prop('disabled', false).text('Save');
+                                    Swal.showValidationMessage(res.message);
+                                }
+                            },
+                            error: function() {
+                                btn.prop('disabled', false).text('Save');
+                                Swal.showValidationMessage('Connection error');
+                            }
+                        });
+                    };
+
+                } else {
+                    Swal.fire('Error', resp.message || 'Taxonomy not found', 'error');
+                }
+            },
+            error: function() {
+                Swal.fire('Error', 'Connection error. Please try again.', 'error');
+            }
+        });
+    });
+
+    // --- VENDOR EVAL v2 REMINDER MODAL ---
+    // Two-step flow. Step 1 asks the server for a preview (SELECT only, no send,
+    // no DB write) and shows exactly which requestors would be contacted. Step 2
+    // sends, and only after the operator ticks the real-send confirmation.
+    var waTable = $('#waTable').DataTable({
+        "pageLength": 10,
+        "dom": 'tp',
+        "order": [[ 1, "asc" ]]
+    });
+
+    var waStage = 'review';        // 'review' -> 'send'
+    var waPreviewSignature = '';   // PO selection the preview was built from
+
+    function waSelectedPOs() {
+        // waTable.$ reaches rows on every page, not just the one on screen.
+        return waTable.$('.wa-checkbox:checked').map(function() { return $(this).val(); }).get();
+    }
+
+    function waSignature(pos) { return pos.slice().sort().join('|'); }
+
+    function waResetToReview() {
+        waStage = 'review';
+        waPreviewSignature = '';
+        $('#wa-preview-panel').addClass('hidden');
+        $('#wa-confirm-wrap').addClass('hidden');
+        $('#wa-confirm-real-send').prop('checked', false);
+        $('#wa-modal-hint').text('Step 1 of 2 — nothing is sent until you review the recipients and confirm.');
+        $('#submit-wa-blast')
+            .html('Review Recipients')
+            .prop('disabled', false)
+            .removeClass('bg-red-600 hover:bg-red-700 bg-gray-400 cursor-not-allowed opacity-75')
+            .addClass('bg-indigo-600 hover:bg-indigo-700');
+        $('#closeWaModalBtn').prop('disabled', false);
+    }
+
+    function waRenderPreview(res) {
+        var d = res.details || {};
+        var rows = (d.requestors || []).map(function(r) {
+            return '<div class="py-1.5 border-b border-gray-200 last:border-0">'
+                 + '<span class="font-bold text-gray-800">' + $('<div>').text(r.requestor_name).html() + '</span>'
+                 + ' <span class="text-gray-500">— ' + r.po_count + ' PO</span><br>'
+                 + '<span class="text-gray-500">email: ' + $('<div>').text(r.email.recipient).html()
+                 + ' &nbsp;|&nbsp; WA: ' + $('<div>').text(r.wa.recipient).html() + '</span>'
+                 + (r.placeholder_wa ? ' <span class="text-amber-700 font-bold">[placeholder WA]</span>' : '')
+                 + '</div>';
+        }).join('');
+
+        $('#wa-preview-headline').text(res.requestor_count + ' requestor(s) · ' + res.po_count + ' PO(s)');
+        $('#wa-preview-body').html(rows || '<em class="text-gray-500">No sendable requestor.</em>');
+
+        var skips = d.skipped_pos || [];
+        $('#wa-preview-skips').html(
+            skips.length
+                ? '<strong>' + skips.length + ' selected PO(s) will be skipped:</strong> '
+                  + skips.slice(0, 8).map(function(s) {
+                        return $('<div>').text(s.po_number + (s.requestor_name ? ' (' + s.requestor_name + ')' : '') + ' — ' + s.reason).html();
+                    }).join('; ')
+                  + (skips.length > 8 ? ' … and ' + (skips.length - 8) + ' more.' : '')
+                : ''
+        );
+        $('#wa-preview-panel').removeClass('hidden');
+    }
+
+    // Post-send result is deliberately terse — the per-requestor/channel detail
+    // this used to render is already in vendor_eval_v2_invite_log for anyone who
+    // needs it. No reload: sending a reminder does not change any row in the
+    // table above (that only happens once the requestor actually submits), so
+    // the dashboard/table/chart state is left exactly as the operator had it.
+    function waRenderResult(res) {
+        Swal.fire({
+            icon: res.success ? 'success' : 'warning',
+            title: res.success ? 'Done.' : 'Partially failed',
+            text: res.success ? '' : (res.message || 'Some reminders failed — check the server log.'),
+            confirmButtonText: 'Close'
+        });
+    }
+
+    $('#open-wa-modal-btn').on('click', function() {
+        waResetToReview();
+        $('#waModal').removeClass('hidden');
+        waTable.columns.adjust();
+    });
+
+    $('#closeWaModalBtn, #waModalOverlay').on('click', function() {
+        $('#waModal').addClass('hidden');
+    });
+
+    $('.wa-col-search').on('keyup change', function() {
+        waTable.column($(this).parent().index()).search(this.value).draw();
+    });
+
+    // Select-all covers the rows matching the current filter only — never rows
+    // the operator has filtered out of view.
+    $('#wa-select-all').on('change', function() {
+        waTable.$('.wa-checkbox', { filter: 'applied' }).prop('checked', $(this).prop('checked'));
+        waResetToReview();
+    });
+
+    // Any change to the selection invalidates a preview the operator already saw.
+    $('#waTable').on('change', '.wa-checkbox', function() {
+        if (waStage === 'send' && waSignature(waSelectedPOs()) !== waPreviewSignature) {
+            waResetToReview();
+        }
+    });
+
+    $('#submit-wa-blast').on('click', function() {
+        var btn = $(this);
+        var selectedPOs = waSelectedPOs();
+
+        if (selectedPOs.length === 0) {
+            Swal.fire({ icon: 'info', title: 'Nothing selected', text: 'Select at least one PO first.' });
+            return;
+        }
+
+        var sending = (waStage === 'send');
+        if (sending) {
+            if (waSignature(selectedPOs) !== waPreviewSignature) { waResetToReview(); return; }
+            if (!$('#wa-confirm-real-send').is(':checked')) {
+                Swal.fire({ icon: 'warning', title: 'Confirmation required', text: 'Tick the confirmation box before sending.' });
+                return;
+            }
+        }
+
+        var payload = { po_numbers: selectedPOs, mode: sending ? 'send' : 'preview' };
+        if (sending) {
+            payload._csrf_ve2 = VE2_CSRF_TOKEN;
+            payload.confirm   = VE2_SEND_CONFIRM;
+        }
+
+        btn.html(sending ? 'Sending…' : 'Checking…')
+           .prop('disabled', true)
+           .addClass('bg-gray-400 cursor-not-allowed opacity-75');
+        $('#closeWaModalBtn').prop('disabled', sending);
+
+        $.ajax({
+            url: 'ajax_send_wa.php',
+            type: 'POST',
+            data: payload,
+            dataType: 'json',
+            timeout: 180000
+        }).done(function(res) {
+            if (!sending) {
+                if (!res.success || res.requestor_count === 0) {
+                    waResetToReview();
+                    waRenderPreview(res);
+                    Swal.fire({ icon: 'warning', title: 'Cannot send', text: res.message });
+                    return;
+                }
+                waRenderPreview(res);
+                waPreviewSignature = waSignature(selectedPOs);
+                waStage = 'send';
+                $('#wa-confirm-wrap').removeClass('hidden');
+                $('#wa-modal-hint').text('Step 2 of 2 — this sends real email and WhatsApp.');
+                btn.html('Send Reminders Now')
+                   .prop('disabled', false)
+                   .removeClass('bg-indigo-600 hover:bg-indigo-700 bg-gray-400 cursor-not-allowed opacity-75')
+                   .addClass('bg-red-600 hover:bg-red-700');
+                return;
+            }
+            $('#waModal').addClass('hidden');
+            waRenderResult(res);
+        }).fail(function(xhr) {
+            var msg = (xhr.responseJSON && xhr.responseJSON.message)
+                   || 'Reminder request failed (HTTP ' + xhr.status + '). Nothing further was sent.';
+            waResetToReview();
+            Swal.fire({ icon: 'error', title: 'Reminder request failed', text: msg });
+        });
+    });
+
+    // --- UNIFIED WORKLOAD CHART ---
+    var chartRawData = <?= json_encode($chart_raw_data) ?>;
+    var isCombined = <?= json_encode($persona === 'COMBINED') ?>;
+    
+    var metricSelect = $('#workloadMetricSelect');
+    var showAllBtn = $('#showAllPicsBtn');
+    
+    var chartTeamInstance = null;
+    var chartPicInstance = null;
+    
+    var currentTeamFilter = null;
+    var forceShowAllPics = false;
+    
+    function calculateMetric(dataList) {
+        var metric = metricSelect.val();
+        var result = 0;
+        
+        if (metric === 'ticket_lines') {
+            result = dataList.length;
+        } else if (metric === 'unique_tickets') {
+            var unique = new Set(dataList.map(function(d) { return d.ticket_no; }));
+            result = unique.size;
+        } else if (metric === 'canvassing') {
+            var unique = new Set(dataList.map(function(d) { return d.canvassing_no; }).filter(Boolean));
+            result = unique.size;
+        } else if (metric === 'po') {
+            var unique = new Set(dataList.map(function(d) { return d.po_number; }).filter(Boolean));
+            result = unique.size;
+        } else if (metric === 'po_amount') {
+            result = dataList.reduce(function(sum, d) { return sum + (parseFloat(d.po_amount) || 0); }, 0);
+        }
+        
+        return result;
+    }
+    
+    function renderCharts() {
+        var metric = metricSelect.val();
+        
+        // Group data by Team and PIC
+        var teamMap = {};
+        var picMap = {};
+        
+        chartRawData.forEach(function(row) {
+            var t = row.team_name;
+            var p = row.assigned_pic;
+            
+            if (!teamMap[t]) teamMap[t] = [];
+            teamMap[t].push(row);
+            
+            if (currentTeamFilter && t !== currentTeamFilter && !forceShowAllPics) return;
+            
+            if (!picMap[p]) picMap[p] = [];
+            picMap[p].push(row);
+        });
+        
+        if (isCombined) {
+            $('#teamChartContainer').removeClass('hidden');
+            $('#picChartContainer').removeClass('w-full').addClass('w-1/2');
+            if (!currentTeamFilter && !forceShowAllPics) {
+                $('#picChartContainer').addClass('hidden');
+                $('#teamChartContainer').removeClass('w-1/2').addClass('w-full');
+            } else {
+                $('#picChartContainer').removeClass('hidden');
+                $('#teamChartContainer').removeClass('w-full').addClass('w-1/2');
+            }
+        } else {
+            $('#teamChartContainer').addClass('hidden');
+            $('#picChartContainer').removeClass('hidden w-1/2').addClass('w-full');
+        }
+        
+        // Team Chart
+        if (isCombined) {
+            var teamLabels = Object.keys(teamMap).sort();
+            var teamData = teamLabels.map(function(t) { return calculateMetric(teamMap[t]); });
+            
+            if (chartTeamInstance) chartTeamInstance.destroy();
+            var ctxTeam = document.getElementById('workloadChartTeam').getContext('2d');
+            chartTeamInstance = new Chart(ctxTeam, {
+                type: 'bar',
+                data: {
+                    labels: teamLabels,
+                    datasets: [{
+                        label: 'Team Workload',
+                        data: teamData,
+                        backgroundColor: 'rgba(52, 211, 153, 0.6)',
+                        borderColor: 'rgba(16, 185, 129, 1)',
+                        borderWidth: 1,
+                        borderRadius: 4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    onClick: function(evt, elements) {
+                        if (elements.length > 0) {
+                            var idx = elements[0].index;
+                            currentTeamFilter = teamLabels[idx];
+                            forceShowAllPics = false;
+                            showAllBtn.removeClass('hidden');
+                            renderCharts();
+                        }
+                    },
+                    scales: { y: { beginAtZero: true, ticks: { precision: (metric === 'po_amount' ? undefined : 0) } } },
+                    plugins: { legend: { display: false } }
+                }
+            });
+        }
+        
+        // PIC Chart
+        if (!isCombined || currentTeamFilter || forceShowAllPics) {
+            var picLabels = Object.keys(picMap).sort(function(a, b) {
+                var valA = calculateMetric(picMap[a]);
+                var valB = calculateMetric(picMap[b]);
+                return valB - valA; // Descending
+            });
+            var picData = picLabels.map(function(p) { return calculateMetric(picMap[p]); });
+            
+            function toInitials(name) {
+                var parts = String(name).split(/\s+/).filter(Boolean).map(function(w) { return w.charAt(0).toUpperCase(); });
+                return parts.join('').slice(0, 2) || String(name).slice(0, 2);
+            }
+            var useShort = picLabels.length > 12;
+            var dispLabels = useShort ? picLabels.map(toInitials) : picLabels;
+            
+            var available = $('#workloadChartWrap').parent().width() || 0;
+            var needed = picLabels.length * 46;
+            $('#workloadChartWrap').css('min-width', Math.max(needed, available) + 'px');
+            
+            if (chartPicInstance) chartPicInstance.destroy();
+            var ctxPic = document.getElementById('workloadChart').getContext('2d');
+            chartPicInstance = new Chart(ctxPic, {
+                type: 'bar',
+                data: {
+                    labels: dispLabels,
+                    datasets: [{
+                        label: 'PIC Workload',
+                        data: picData,
+                        backgroundColor: 'rgba(79, 70, 229, 0.6)',
+                        borderColor: 'rgba(79, 70, 229, 1)',
+                        borderWidth: 1,
+                        borderRadius: 4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: { y: { beginAtZero: true, ticks: { precision: (metric === 'po_amount' ? undefined : 0) } } },
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: { callbacks: { title: function(items) { return items.length ? picLabels[items[0].dataIndex] : ''; } } }
+                    }
+                }
+            });
+        }
+    }
+    
+    metricSelect.on('change', renderCharts);
+    showAllBtn.on('click', function() {
+        currentTeamFilter = null;
+        forceShowAllPics = true;
+        $(this).addClass('hidden');
+        renderCharts();
+    });
+    
+    // Initial Render
+    if (isCombined) {
+        forceShowAllPics = false;
+        // showAllBtn is hidden by default
+    }
+    renderCharts();
+
+    // Chart is drawn — remove its loading skeleton.
+    $('.viz-chart-loader').fadeOut(200);
+});
+</script>
+
+
+<?php require_once '../includes/footer.php'; ?>

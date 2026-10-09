@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body {
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        background: #f0f4f8; 
+        font-family: 'Inter', sans-serif;
+        color: #1a202c; 
+      }
+
+      .clip { visibility: hidden; }
+      .scene {
+        position: absolute;
+        top: 0; left: 0;
+        width: 1920px; height: 1080px;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        text-align: center;
+      }
+
+      .inner {
+        width: 100%; height: 100%;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+      }
+
+      .inner-feature {
+        width: 100%; height: 100%;
+        display: flex;
+        flex-direction: row;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0 100px;
+      }
+
+      .title-large {
+        font-size: 80px; font-weight: 800; line-height: 1.2;
+        max-width: 1600px; margin-bottom: 12px; color: #0f172a;
+      }
+      .subtitle {
+        font-size: 48px; font-weight: 400; color: #475569; max-width: 1400px;
+      }
+      .feature-text-container {
+        width: 35%; text-align: left; padding-right: 40px;
+      }
+      .feature-title {
+        font-size: 64px; font-weight: 800; color: #1e3a8a; margin-bottom: 24px; line-height: 1.1;
+      }
+      .feature-desc {
+        font-size: 36px; font-weight: 400; color: #334155; line-height: 1.4;
+      }
+      .feature-image-container {
+        width: 65%; display: flex; justify-content: center; align-items: center; perspective: 1500px;
+      }
+      .feature-image {
+        max-width: 100%; max-height: 900px; border-radius: 16px;
+        box-shadow: 0 60px 80px -20px rgba(0,0,0,0.5), 0 30px 50px -15px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.6);
+        border: 1px solid rgba(255,255,255,0.5);
+        transform-style: preserve-3d;
+      }
+      .bg-circle {
+        position: absolute; border-radius: 50%;
+        background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%);
+        z-index: -1; opacity: 0.6;
+      }
+      .circle-1 { width: 800px; height: 800px; top: -200px; left: -200px; }
+      .circle-2 { width: 600px; height: 600px; bottom: -100px; right: -100px; }
+    </style>
+  </head>
+  <body>
+    <div id="root" data-composition-id="main" data-start="0" data-duration="210" data-width="1920" data-height="1080">
+      <div class="bg-circle circle-1" data-layout-allow-overflow="true"></div>
+      <div class="bg-circle circle-2" data-layout-allow-overflow="true"></div>
+      
+      <!-- Audio Tracks (VO Energetic Version) -->
+      <audio id="bg-music" data-track-index="0" src="assets/inspired_low.mp3" data-start="0" data-duration="210"></audio>
+      
+      <audio id="vo-1" data-track-index="1" src="assets/vo_current_1.mp3" data-start="5.5" data-duration="17"></audio>
+      <audio id="vo-2" data-track-index="1" src="assets/vo_current_2.mp3" data-start="23.0" data-duration="17"></audio>
+      <audio id="vo-3" data-track-index="1" src="assets/vo_current_3.mp3" data-start="40.5" data-duration="17"></audio>
+      <audio id="vo-4" data-track-index="1" src="assets/vo_current_4.mp3" data-start="58.0" data-duration="17"></audio>
+      <audio id="vo-5" data-track-index="1" src="assets/vo_current_5.mp3" data-start="75.5" data-duration="24"></audio>
+      <audio id="vo-6" data-track-index="1" src="assets/vo_current_6.mp3" data-start="100.5" data-duration="24"></audio>
+      <audio id="vo-7" data-track-index="1" src="assets/vo_current_7.mp3" data-start="125.5" data-duration="17"></audio>
+      <audio id="vo-8" data-track-index="1" src="assets/vo_current_8.mp3" data-start="143.0" data-duration="17"></audio>
+      <audio id="vo-9" data-track-index="1" src="assets/vo_current_9.mp3" data-start="160.5" data-duration="17"></audio>
+      <audio id="vo-10" data-track-index="1" src="assets/vo_current_10.mp3" data-start="178.0" data-duration="17"></audio>
+
+      <!-- Intro (0 - 5s) -->
+      <div id="intro" class="scene clip" data-track-index="2" data-start="0" data-duration="5">
+        <div class="inner">
+          <h1 class="title-large intro-text">H2 Digital Improvement Plan</h1>
+          <p class="subtitle intro-sub" style="margin-top:20px; font-size:40px;">Corporate Procurement 2026</p>
+        </div>
+      </div>
+
+      <!-- Features -->
+      <div id="feat-1" class="scene clip" data-track-index="2" data-start="5" data-duration="17.5"><div class="inner-feature">
+        <div class="feature-text-container"><h2 class="feature-title">Overview Vendor Terdaftar</h2><p class="feature-desc">Menampilkan sebaran vendor di seluruh Indonesia berdasarkan skor risiko dan taksonomi.</p></div>
+        <div class="feature-image-container"><img src="assets/image_1_new.png" class="feature-image" /></div>
+      </div></div>
+
+      <div id="feat-2" class="scene clip" data-track-index="2" data-start="22.5" data-duration="17.5"><div class="inner-feature">
+        <div class="feature-text-container"><h2 class="feature-title">Analisis Pengeluaran</h2><p class="feature-desc">Memetakan posisi vendor sebagai mitra strategis berdasarkan taksonomi pengeluaran.</p></div>
+        <div class="feature-image-container"><img src="assets/image_2_new.png" class="feature-image" /></div>
+      </div></div>
+
+      <div id="feat-3" class="scene clip" data-track-index="2" data-start="40" data-duration="17.5"><div class="inner-feature">
+        <div class="feature-text-container"><h2 class="feature-title">Hasil Evaluasi Vendor</h2><p class="feature-desc">Penilaian performa secara kualitatif dan kuantitatif berdasarkan pengiriman barang dan penyelesaian jasa.</p></div>
+        <div class="feature-image-container"><img src="assets/image_3_new.png" class="feature-image" /></div>
+      </div></div>
+
+      <div id="feat-4" class="scene clip" data-track-index="2" data-start="57.5" data-duration="17.5"><div class="inner-feature">
+        <div class="feature-text-container"><h2 class="feature-title">Form Evaluasi Digital</h2><p class="feature-desc">Kemudahan bagi pengguna untuk mengisi penilaian performa vendor langsung ke dalam sistem.</p></div>
+        <div class="feature-image-container"><img src="assets/image_4_new.png" class="feature-image" /></div>
+      </div></div>
+
+      <div id="feat-5" class="scene clip" data-track-index="2" data-start="75" data-duration="25"><div class="inner-feature">
+        <div class="feature-text-container"><h2 class="feature-title">SLA Lead Time Tracking</h2><p class="feature-desc">Dashboard transparan untuk memastikan layanan pengadaan yang lebih cepat dan selalu tepat waktu.</p></div>
+        <div class="feature-image-container"><img src="assets/image_5_new.png" class="feature-image" /></div>
+      </div></div>
+
+      <div id="feat-6" class="scene clip" data-track-index="2" data-start="100" data-duration="25"><div class="inner-feature">
+        <div class="feature-text-container"><h2 class="feature-title">Kamus SKU & Integrasi AI</h2><p class="feature-desc">Membantu pengguna mencari item yang relevan, serta memetakan taksonomi secara otomatis ke tim pengadaan yang tepat.</p></div>
+        <div class="feature-image-container"><img src="assets/image_6_new.png" class="feature-image" /></div>
+      </div></div>
+
+      <div id="feat-7" class="scene clip" data-track-index="2" data-start="125" data-duration="17.5"><div class="inner-feature">
+        <div class="feature-text-container"><h2 class="feature-title">Pembukaan Seal Penawaran</h2><p class="feature-desc">Menjamin proses tender yang adil dan transparan melalui pembukaan segel penawaran yang aman.</p></div>
+        <div class="feature-image-container"><img src="assets/image_7_new.png" class="feature-image" /></div>
+      </div></div>
+
+      <div id="feat-8" class="scene clip" data-track-index="2" data-start="142.5" data-duration="17.5"><div class="inner-feature">
+        <div class="feature-text-container"><h2 class="feature-title">Integrasi Profil Risiko</h2><p class="feature-desc">Menghubungkan RFQ dengan data vendor untuk memitigasi risiko sejak tahap awal tender.</p></div>
+        <div class="feature-image-container"><img src="assets/image_8_new.png" class="feature-image" /></div>
+      </div></div>
+
+      <div id="feat-9" class="scene clip" data-track-index="2" data-start="160" data-duration="17.5"><div class="inner-feature">
+        <div class="feature-text-container"><h2 class="feature-title">Penawaran Digital</h2><p class="feature-desc">Memudahkan vendor untuk mengisi penawaran komersial langsung melalui sistem VSS.</p></div>
+        <div class="feature-image-container"><img src="assets/image_9_new.png" class="feature-image" /></div>
+      </div></div>
+
+      <div id="feat-10" class="scene clip" data-track-index="2" data-start="177.5" data-duration="17.5"><div class="inner-feature">
+        <div class="feature-text-container"><h2 class="feature-title">Tender Committee Seal Opening</h2><p class="feature-desc">Pembukaan segel tender oleh komite untuk meninjau rincian penawaran secara kredibel.</p></div>
+        <div class="feature-image-container"><img src="assets/image_10_new.png" class="feature-image" /></div>
+      </div></div>
+
+      <!-- Timeline (195 - 205s) -->
+      <div id="timeline" class="scene clip" data-track-index="2" data-start="195" data-duration="10">
+        <div class="inner">
+          <h1 class="title-large time-text">Coming Soon on H2 2026!</h1>
+          <p class="subtitle time-sub">by Corporate Procurement</p>
+        </div>
+      </div>
+
+      <!-- Outro (205 - 210s) -->
+      <div id="outro" class="scene clip" data-track-index="2" data-start="205" data-duration="5">
+        <div class="inner">
+          <h1 class="title-large outro-text" style="font-size: 100px; color: #1e3a8a;">Thank You</h1>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+
+      function animateFeature(id, startTime, duration, index) {
+        const inner = id + " .inner-feature";
+        const isEven = index % 2 === 0;
+        
+        // Transitions varitions
+        const textStartX = isEven ? -60 : 60;
+        const imgStartY = isEven ? 40 : -40;
+        const initialRotY = isEven ? -15 : 15;
+        const initialRotX = isEven ? 5 : -5;
+        
+        // Scene enter
+        tl.fromTo(inner, { opacity: 0 }, { opacity: 1, duration: 0.5, ease: "power2.out" }, startTime);
+        
+        // Text enter
+        tl.fromTo(id + " .feature-text-container", 
+          { x: textStartX, opacity: 0 }, 
+          { x: 0, opacity: 1, duration: 0.8, ease: "power3.out" }, 
+          startTime + 0.2
+        );
+        
+        // Image enter with 3D tilt
+        tl.fromTo(id + " .feature-image", 
+          { scale: 0.9, rotationY: initialRotY, rotationX: initialRotX, y: imgStartY, opacity: 0 }, 
+          { scale: 1, rotationY: initialRotY / 2, rotationX: 0, y: 0, opacity: 1, duration: 1.2, ease: "power3.out" }, 
+          startTime + 0.4
+        );
+        
+        // Continuous slow pan/zoom (Alive effect)
+        tl.to(id + " .feature-image", { 
+          rotationY: (isEven ? 5 : -5), 
+          rotationX: (isEven ? -2 : 2),
+          scale: 1.05, 
+          x: (isEven ? 10 : -10),
+          y: (isEven ? -10 : 10),
+          duration: duration - 1.0, 
+          ease: "sine.inOut" 
+        }, startTime + 1.6);
+
+        // Scene exit
+        tl.to(inner, { opacity: 0, duration: 0.4, ease: "power2.in" }, startTime + duration - 0.4);
+        tl.set(inner, { opacity: 0 }, startTime + duration); // hard kill
+      }
+
+      // Intro
+      tl.fromTo("#intro .inner", { opacity: 0 }, { opacity: 1, duration: 0.8 }, 0);
+      tl.fromTo(".intro-text", { y: 30, opacity: 0 }, { y: 0, opacity: 1, duration: 1.2, ease: "power3.out" }, 0.5);
+      tl.fromTo(".intro-sub", { y: 20, opacity: 0 }, { y: 0, opacity: 1, duration: 1.0, ease: "power2.out" }, 1.0);
+      tl.to("#intro .inner", { opacity: 0, scale: 1.05, duration: 0.6, ease: "power2.in" }, 4.4);
+      tl.set("#intro .inner", { opacity: 0 }, 5.0); // hard kill
+
+      // Features Setup
+      const timings = [
+        { id: "#feat-1", start: 5, dur: 17.5 },
+        { id: "#feat-2", start: 22.5, dur: 17.5 },
+        { id: "#feat-3", start: 40, dur: 17.5 },
+        { id: "#feat-4", start: 57.5, dur: 17.5 },
+        { id: "#feat-5", start: 75, dur: 25 },
+        { id: "#feat-6", start: 100, dur: 25 },
+        { id: "#feat-7", start: 125, dur: 17.5 },
+        { id: "#feat-8", start: 142.5, dur: 17.5 },
+        { id: "#feat-9", start: 160, dur: 17.5 },
+        { id: "#feat-10", start: 177.5, dur: 17.5 }
+      ];
+
+      timings.forEach((t, i) => animateFeature(t.id, t.start, t.dur, i));
+
+      // Timeline
+      tl.fromTo("#timeline .inner", { opacity: 0 }, { opacity: 1, duration: 0.8 }, 195);
+      tl.fromTo(".time-text", { scale: 0.9, opacity: 0 }, { scale: 1, opacity: 1, duration: 1.2, ease: "back.out(1.5)" }, 195.5);
+      tl.fromTo(".time-sub", { y: 20, opacity: 0 }, { y: 0, opacity: 1, duration: 1.0, ease: "power2.out" }, 196.0);
+      tl.to("#timeline .inner", { opacity: 0, duration: 0.6, ease: "power2.in" }, 204.4);
+      tl.set("#timeline .inner", { opacity: 0 }, 205.0); // hard kill
+
+      // Outro
+      tl.fromTo("#outro .inner", { opacity: 0 }, { opacity: 1, duration: 0.8 }, 205);
+      tl.fromTo(".outro-text", { y: -20, opacity: 0 }, { y: 0, opacity: 1, duration: 1.5, ease: "power3.out" }, 205.5);
+      tl.set("#outro .inner", { opacity: 1 }, 210.0); // hard kill for outro end
+
+      window.__timelines["main"] = tl;
+    </script>
+  </body>
+</html>

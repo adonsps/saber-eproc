@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 340 68" width="340" height="68">
+  <defs>
+    <linearGradient id="cyanGlowLight" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#00D8FF"/>
+    </linearGradient>
+  </defs>
+  
+  <!-- Saber Dual-Blade Emblem (White & Cyan) -->
+  <g transform="translate(6, 4) scale(0.38)">
+    <!-- Top Blade -->
+    <path d="M 12 40 C 35 15, 129 15, 152 40 C 120 48, 44 48, 12 40 Z" fill="#FFFFFF"/>
+    <!-- Middle Cyan Core Pill -->
+    <rect x="46" y="68" width="72" height="16" rx="8" fill="url(#cyanGlowLight)"/>
+    <!-- Bottom Blade -->
+    <path d="M 12 112 C 44 104, 120 104, 152 112 C 129 137, 35 137, 12 112 Z" fill="#FFFFFF"/>
+  </g>
+
+  <!-- Typography: SABER eProc -->
+  <g transform="translate(76, 40)">
+    <text font-family="'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="900" font-size="28" fill="#FFFFFF" letter-spacing="-0.5px">SABER</text>
+    <text x="104" font-family="'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="800" font-size="28" fill="#38BDF8" letter-spacing="-0.5px"> eProc</text>
+  </g>
+  <g transform="translate(77, 56)">
+    <text font-family="'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" font-size="8.5" fill="#94A3B8" letter-spacing="2.2px">ENTERPRISE PROCUREMENT WORKSPACE</text>
+  </g>
+</svg>

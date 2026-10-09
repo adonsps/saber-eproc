@@ -1,0 +1,115 @@
+/* ==========================================================================
+   SABER ePROC — Workspace Custom Styling & Component Overrides
+   ========================================================================== */
+
+/* 1. Global Font: Plus Jakarta Sans */
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+html, body, table, th, td, input, select, textarea, button, a, p, span, h1, h2, h3, h4, h5, h6 {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+}
+
+/* 2. DataTables Base Overrides */
+.dataTables_wrapper .dataTables_filter input { 
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    padding: 0.4rem 0.85rem; 
+    margin-left: 0.5rem; 
+    outline: none;
+    box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.04);
+    font-size: 0.875rem;
+    transition: all 150ms ease;
+}
+
+.dataTables_wrapper .dataTables_filter input:focus {
+    border-color: #1e40af; /* Saber Blue 800 */
+    box-shadow: 0 0 0 3px rgba(30, 64, 175, 0.15);
+}
+
+.dataTables_wrapper .dataTables_length select { 
+    border: 1px solid #cbd5e1; 
+    border-radius: 8px; 
+    padding: 0.35rem 1.75rem 0.35rem 0.75rem; 
+    outline: none;
+    font-size: 0.875rem;
+}
+
+table.dataTable thead th, table.dataTable thead td { 
+    border-bottom: 1px solid #e2e8f0 !important; 
+    font-weight: 700 !important;
+    color: #334155 !important;
+    text-transform: uppercase !important;
+    font-size: 0.75rem !important;
+    letter-spacing: 0.05em !important;
+}
+
+table.dataTable tbody tr:hover td {
+    background-color: #f8fafc !important;
+}
+
+/* 3. Custom Scrollbars */
+.checkbox-list::-webkit-scrollbar,
+::-webkit-scrollbar { 
+    width: 6px; 
+    height: 6px; 
+}
+.checkbox-list::-webkit-scrollbar-track,
+::-webkit-scrollbar-track { 
+    background: #f8fafc; 
+}
+.checkbox-list::-webkit-scrollbar-thumb,
+::-webkit-scrollbar-thumb { 
+    background: #cbd5e1; 
+    border-radius: 9999px; 
+}
+.checkbox-list::-webkit-scrollbar-thumb:hover,
+::-webkit-scrollbar-thumb:hover { 
+    background: #94a3b8; 
+}
+
+/* 4. Global Search & Entries Spacing */
+.dataTables_wrapper .dataTables_filter, 
+.dataTables_wrapper .dataTables_length {
+    margin-bottom: 1rem; 
+    color: #475569;
+    font-size: 0.875rem;
+    font-weight: 500;
+}
+
+/* Column Search Input Spacing */
+table.dataTable thead th input[type="text"], 
+table.dataTable thead th input[type="date"] {
+    margin-bottom: 0.5rem; 
+    font-family: inherit;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 0.8rem;
+}
+
+/* 5. Cost Avoidance: Input Baselines staged changes */
+.ca-pending-field {
+    border-color: #ea580c !important; /* Saber Orange */
+    background-color: #fff7ed !important;
+    box-shadow: 0 0 0 2px rgba(234, 88, 12, 0.2) !important;
+}
+
+.ca-error-field {
+    border-color: #be123c !important; /* Saber Rose/Danger */
+    background-color: #fff1f2 !important;
+    box-shadow: 0 0 0 2px rgba(190, 18, 60, 0.2) !important;
+}
+
+#caBaselinesFilterSlot .dataTables_filter {
+    float: none;
+    text-align: left;
+    margin-bottom: 0 !important;
+}
+
+/* 6. Active Sidebar Navigation Indicator */
+#desktopSidebar nav a.active {
+    background-color: #eff6ff !important;
+    color: #1e40af !important;
+    font-weight: 700 !important;
+    border-left: 3px solid #1e40af !important;
+}

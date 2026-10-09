@@ -1,0 +1,8 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 164 152' width='164' height='152'>
+  <!-- Top Blade -->
+  <path d='M 12 40 C 35 15, 129 15, 152 40 C 120 48, 44 48, 12 40 Z' fill='#0F1E36'/>
+  <!-- Middle Cyan Pill -->
+  <rect x='46' y='68' width='72' height='16' rx='8' fill='#0090FF'/>
+  <!-- Bottom Blade -->
+  <path d='M 12 112 C 44 104, 120 104, 152 112 C 129 137, 35 137, 12 112 Z' fill='#0F1E36'/>
+</svg>

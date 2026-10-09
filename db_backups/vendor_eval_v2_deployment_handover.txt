@@ -1,0 +1,264 @@
+================================================================================
+VENDOR EVALUATION v2 — DB DEPLOYMENT HANDOVER
+Prepared: 2026-07-06 (supersedes vendor_eval_v2_db_deployment_handover_20260706.txt)
+Source branch: feature/vendor-eval-v2-taxonomy-mapping
+================================================================================
+
+This document is the team-facing deployment package for Vendor Evaluation v2.
+It assumes the reader has DB access to the target environment (QA or
+production) and is applying these changes for the first time there.
+
+The SQL package is now consolidated into these files. Use ONLY these:
+  1. db_backups/vendor_eval_v2_01_schema.sql
+  2. db_backups/vendor_eval_v2_02_seed_business_data.sql
+  3. db_backups/vendor_eval_v2_03_seed_requestor_contacts.sql
+  4. db_backups/vendor_eval_v2_04_po_question_set_override.sql   (Manual Question Set
+     Assignment queue; additive, schema-only, NO data — needs file 1's
+     vendor_eval_question_sets for its FK. Independent of files 2/3.)
+  5. db_backups/vendor_eval_v2_05_form2_dual_submissions.sql     (Form 2
+     Ops/Project dual-team submissions: vendor_eval_submissions.team +
+     uq_po_team index, and vendor_eval_v2_form2_worklist_token.)
+  6. db_backups/vendor_eval_v2_06_form2_team_contacts.sql        (Form 2
+     team contact roster — vendor_eval_v2_form2_team_contacts, seeded with
+     10 Ops/Project distribution-list people. Distribution/reminder
+     targeting only, not access control. Independent of files 1-5 other
+     than needing the DB to exist.)
+Apply them in that exact order. The older individual migration files
+(item_taxonomy_db_view.sql, vendor_eval_po_taxonomy.sql,
+vendor_eval_requestor_manager_email.sql, vendor_eval_v2_question_schema.sql,
+vendor_eval_v2_question_master_schema.sql, vendor_eval_v2_rubric_question_schema.sql,
+vendor_eval_v2_question_identification_fields.sql, vendor_eval_v2_invite_log.sql,
+vendor_eval_v2_prs_master_data_id.sql) have been removed from db_backups/ as of
+the cleanup/vendor-eval-db-backups branch — their content is fully folded into
+file 1 above. They were intentionally not part of this deployment package even
+before removal; if historical reference is ever needed, they remain retrievable
+from git history prior to that cleanup commit.
+
+--------------------------------------------------------------------------------
+1. FILE 1 — db_backups/vendor_eval_v2_01_schema.sql
+--------------------------------------------------------------------------------
+  Combines, in dependency order:
+    - item_taxonomy_db_view, item_taxonomy_import_meta, v_item_taxonomy (view)
+    - vendor_eval_po_taxonomy
+    - requestors.manager_email + index
+    - vendor_eval_question_sets, vendor_eval_questions,
+      vendor_eval_question_set_taxonomy_map, vendor_eval_submissions,
+      vendor_eval_answers, vendor_eval_question_import_batches
+    - rubric/question_type columns; vendor_eval_answers.score nullable
+    - question_help_text/question_image_path
+    - question_section + input_type (identification vs evaluation questions)
+    - vendor_eval_v2_invite_log (REQUIRED before any production send)
+    - prs.master_data_id + index (see section 4 — taxonomy routing source)
+
+  Additive / re-runnable only: CREATE TABLE IF NOT EXISTS, ADD COLUMN IF NOT
+  EXISTS, CREATE INDEX IF NOT EXISTS, or information_schema-guarded DDL. No
+  DROP, DELETE, or TRUNCATE anywhere in this file. Safe to re-run.
+
+--------------------------------------------------------------------------------
+2. FILE 2 — db_backups/vendor_eval_v2_02_seed_business_data.sql
+--------------------------------------------------------------------------------
+  SECTION A — Question-set seed: 11 active/final question sets, 65 questions
+  (53 rating + 12 text/"Kesimpulan"; 1 of those is a configurable
+  identification question), 11 taxonomy routing rows (10 specific + 1 default
+  fallback). Writes question_section + input_type (needs file 1 applied
+  first). Every set's rating-question weights sum to exactly 1.0000.
+  Idempotent (matched on set_code+version / question_set_id+question_no /
+  map_level+taxonomy_level_2+taxonomy_level_3). Does NOT include
+  vendor_eval_submissions or vendor_eval_answers (local test data only —
+  never exported).
+
+  SECTION B — PO taxonomy seed (CONDITIONAL — read the caveat in the file
+  header before using): 311 rows, status='mapped' only (41 local
+  'needs_review' rows excluded — re-review those fresh on the target instead
+  of carrying them over). No personal contact data (only requestor NAMES in a
+  JSON column). IMPORTANT: this data is DERIVED from THIS dev DB's own `prs`
+  table; a row is only useful on a target whose `prs` has the same po_number.
+  RECOMMENDED on any target with its own live PO data (real production or a
+  differently-scoped QA): run tools/run_po_taxonomy_mapping.php (dry-run
+  first) against that target's own prs table instead of importing Section B.
+  See section 4 below for the master_data_id path, which supersedes both the
+  fuzzy mapper AND this seed once populated.
+
+--------------------------------------------------------------------------------
+3. FILE 3 — db_backups/vendor_eval_v2_03_seed_requestor_contacts.sql
+--------------------------------------------------------------------------------
+  SENSITIVE: contains employee contact data (53 requestors — email,
+  whatsapp_number, manager_email, manager_username where non-empty). User
+  approved committing this file for team deployment.
+
+  - Does NOT include public_token — tokens must be generated fresh per
+    environment (never reused across dev/QA/prod).
+  - Assumes the target already HAS these 53 requestor rows (created via
+    tools/import_vendor_eval_requestors.php). This file only updates contact
+    columns on existing rows; it does not create new ones.
+  - Known caveats: 2 rows are resignation placeholders (not contact-ready);
+    6 rows fall back to the Adonis default contact (no personal contact
+    captured yet).
+  - Review before applying to any shared environment; do not forward this
+    file outside the deployment team.
+
+--------------------------------------------------------------------------------
+4. master_data_id — TAXONOMY ROUTING SOURCE (audited 2026-07-06)
+--------------------------------------------------------------------------------
+  Supervisor direction: the authoritative taxonomy source is
+  prs.master_data_id -> master_data.id (main/production already carries this
+  column and a PIC/dashboard workflow that populates it per PR line item —
+  see ajax_update_pr_taxonomy.php on main). vendor_eval_po_taxonomy REMAINS
+  the PO-level routing bridge/cache; only where its values come from changes.
+
+  Vocabulary confirmed aligned: master_data.level_2/level_3 use the SAME Sub
+  Category / Commodity taxonomy vocabulary as v_item_taxonomy and
+  vendor_eval_po_taxonomy.taxonomy_level_2/level_3 (verified by direct data
+  comparison — level_2 values like Hardware, Networking, Software, Soft
+  Services, etc. overlap; do NOT assume this without re-verifying on a new
+  target, per the original audit instruction not to assume level_2 = Sub
+  Category blindly).
+
+  Local status as of this handover:
+    - prs.master_data_id added locally (file 1, section 9) — additive,
+      schema-only, zero data population risk.
+    - Local `prs` has ZERO rows with master_data_id populated (21,702 total
+      rows, 0 populated) — expected, since that population only happens via
+      the main-branch PIC/dashboard workflow, which this branch does not
+      have. The refresh CANNOT improve local mapping until master_data_id is
+      populated, either by that workflow reaching this branch or by syncing
+      production data.
+    - tools/refresh_vendor_eval_po_taxonomy_from_master_data.php was built
+      and run in --preview: confirmed 0/3,072 in-scope POs have
+      master_data_id coverage locally. NOT applied (nothing to apply).
+    - The OLD fuzzy item-description mapper (tools/run_po_taxonomy_
+      mapping.php) is NOT deleted or disabled — it remains the active
+      fallback/deprecated-but-working source for any PO whose lines lack
+      master_data_id, and is currently the sole source of Section B above.
+
+  On a target where prs.master_data_id IS populated (production, once main
+  is reconciled): run tools/refresh_vendor_eval_po_taxonomy_from_master_data.php
+  --preview first, review the coverage/comparison report, then --apply only
+  after explicit approval and a backup — same DB-write discipline as any
+  other apply-mode tool here.
+
+  DO NOT merge main into this branch (or vice versa) blindly to pick up
+  master_data_id or anything else. The protected files
+  (workspace/config/database.php, workspace/includes/auth.php,
+  workspace/pages/user_management.php) and the v1 vendor_evaluations path
+  must be reconciled carefully first, by explicit request.
+
+--------------------------------------------------------------------------------
+5. DO NOT APPLY
+--------------------------------------------------------------------------------
+  - db_backups/vendor_eval_v2_remove_local_test_question_sets.sql — written
+    2026-07-01 to hard-delete 8 named LOCAL-TEST question sets. STALE as of
+    2026-07-06: this DB now has 11 real, active question sets, and the
+    script's DELETE logic ("set_code <> 'VE_OUTSOURCING_PARKING_V1'") would
+    delete 10 legitimate question sets if run now. Historical cleanup only —
+    never run unattended. Removed from db_backups/ as of the
+    cleanup/vendor-eval-db-backups branch; retrievable from git history prior
+    to that cleanup commit if ever needed.
+  - Anything under db_backups/local_runtime_backups/,
+    db_backups/local_runtime_exports/, db_backups/local_runtime_imports/ —
+    these are gitignored, machine-local artifacts (rollback snapshots / tool
+    output), never deployment inputs for another environment.
+  - db_backups/workspace_dump.sql, db_backups/vmsportal_dump.sql — full local
+    dumps, not scoped migrations; not part of this deployment package.
+
+--------------------------------------------------------------------------------
+6. PRODUCTION BASE URL
+--------------------------------------------------------------------------------
+  https://vssportal.online/vms/workspace/pages
+
+  Public evaluation links generated by the invite sender must use this base
+  URL in production — never the local dev URL.
+
+--------------------------------------------------------------------------------
+7. PRODUCTION MIGRATION FLOW
+--------------------------------------------------------------------------------
+  1. Backup the target DB in full before touching anything.
+  2. Apply vendor_eval_v2_01_schema.sql.
+  3. Apply vendor_eval_v2_02_seed_business_data.sql.
+  4. Apply vendor_eval_v2_03_seed_requestor_contacts.sql.
+  5. Apply vendor_eval_v2_04_po_question_set_override.sql.
+  6. Run the readiness audit checklist (section 8 below).
+  7. Dry-run the sender (section 9 template) — SELECT-only, no sends.
+  8. Production send is a SEPARATE, explicit operational approval — never
+     bundled with a migration/deployment step.
+
+--------------------------------------------------------------------------------
+8. READINESS AUDIT CHECKLIST (run before any send, on the target)
+--------------------------------------------------------------------------------
+  [ ] All of file 1's schema applied — verify via SHOW TABLES / SHOW CREATE
+      TABLE (confirm question_section + input_type exist on
+      vendor_eval_questions; confirm prs.master_data_id exists).
+  [ ] Question set seed applied (file 2, Section A); verify with:
+        SELECT set_code, is_active FROM vendor_eval_question_sets
+          WHERE is_active=1 ORDER BY set_code;
+      Expect exactly these 11 active set_codes, all is_active=1:
+        VE_DEFAULT_GENERAL_V1
+        VE_OUTSOURCING_PARKING_V1
+        VE_OUTSOURCING_PEST CONTROL_V1
+        VE_OUTSOURCING_VALET_V1
+        VE_OUTSOURCING_HYGENE_V1
+        VE_OUTSOURCING_GARBAGE REMOVAL_V1
+        VE_OUTSOURCING_LANDSCAPE_V1
+        VE_OUTSOURCING_CUSTOMER SERVICE_V1
+        VE_OUTSOURCING_SECURITY_V1
+        VE_OUTSOURCING_HOUSEKEEPING_V1
+        VE_PROJECT_RETAIL_V1
+  [ ] Requestor contacts present and populated (import first if needed, then
+      file 3 for existing rows) — verify with:
+        SELECT COUNT(*) FROM requestors WHERE email IS NOT NULL AND email <> '';
+  [ ] Every requestor has a fresh, target-specific public_token — verify with:
+        SELECT COUNT(*) FROM requestors WHERE public_token IS NULL OR public_token = '';
+      (expect 0)
+  [ ] PO taxonomy mapping run against target's OWN prs data. Prefer, in
+      order: (a) tools/refresh_vendor_eval_po_taxonomy_from_master_data.php
+      if the target's prs.master_data_id is populated, else (b)
+      tools/run_po_taxonomy_mapping.php against the fuzzy matcher, over (c)
+      importing file 2's Section B as-is. Verify with:
+        SELECT status, COUNT(*) FROM vendor_eval_po_taxonomy GROUP BY status;
+  [ ] tools/audit_po_taxonomy_candidates.php run and reviewed — no unexpected
+      spike in 'needs_review'/'unresolved' rows.
+  [ ] vendor_eval_v2_invite_log exists and is empty (0 rows) before first
+      send on this environment:
+        SELECT COUNT(*) FROM vendor_eval_v2_invite_log;
+  [ ] No vendor_eval_submissions / vendor_eval_answers rows present that
+      originated from local dev testing.
+
+--------------------------------------------------------------------------------
+9. DRY-RUN COMMAND TEMPLATE
+--------------------------------------------------------------------------------
+  php tools/send_vendor_eval_v2_invites.php \
+    --confirm-db=<TARGET_DB_NAME> \
+    --confirm-host=<TARGET_DB_HOSTNAME>
+
+  (Default mode is dry-run: SELECT-only, writes a preview CSV, sends nothing.
+  Review the preview CSV fully before proceeding to any test-send.)
+
+--------------------------------------------------------------------------------
+10. PRODUCTION SEND COMMAND TEMPLATE — DO NOT RUN
+--------------------------------------------------------------------------------
+  php tools/send_vendor_eval_v2_invites.php \
+    --apply \
+    --confirm-db=<TARGET_DB_NAME> \
+    --confirm-host=<TARGET_DB_HOSTNAME>
+
+  This template is documentation only. Do not run any send (guarded
+  test-send or full production send) without explicit, separate approval at
+  the time of sending — per project safety rules, WA/email sends always
+  require a distinct, explicit go-ahead.
+
+--------------------------------------------------------------------------------
+11. HOSTNAME CONFIRMATION — DO NOT REUSE THE LOCAL VALUE
+--------------------------------------------------------------------------------
+  This dev machine's @@hostname is KLG-PROC-I01271. That value is specific to
+  this workstation and must NEVER be used as --confirm-host for any --apply
+  run against QA or production. Before running --apply on any target, query
+  that target directly:
+        SELECT DATABASE(), USER(), @@hostname, VERSION();
+  and use ITS OWN @@hostname as --confirm-host. Passing KLG-PROC-I01271
+  against a remote target should cause the tool's identity gate to fail
+  closed (by design) rather than silently proceed. The same rule applies to
+  tools/refresh_vendor_eval_po_taxonomy_from_master_data.php.
+
+================================================================================
+END OF HANDOVER.
+================================================================================

@@ -1,0 +1,14 @@
+<?php
+// workspace/config/vendor_eval_fonnte.local.php.example
+//
+// Copy this file to vendor_eval_fonnte.local.php (untracked, see .gitignore)
+// and fill in the real Vendor-Eval-only Fonnte token. This file is loaded by
+// workspace/includes/vendor_eval_v2_fonnte.php ONLY when the VE2_FONNTE_TOKEN
+// environment variable is not set.
+//
+// Never commit the real vendor_eval_fonnte.local.php file.
+
+return [
+    'token' => 'PASTE_VENDOR_EVAL_FONNTE_TOKEN_HERE',
+    'sender_number' => '6289529521143',
+];

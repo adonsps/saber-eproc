@@ -1,0 +1,10 @@
+Require all denied
+
+# Nightly VSS backup receiver — the only file in this directory ever meant
+# to be web-reachable, and only on the VPS (see receive_backup.php's own
+# VSS_BACKUP_RECEIVER_ENABLED gate, which 404s this unconditionally on any
+# host — e.g. Hostinger — where that env var isn't set).
+<Files "receive_backup.php">
+    Require all granted
+</Files>
+

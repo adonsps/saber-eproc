@@ -1,0 +1,40 @@
+--- workspace/pages/dashboard_mgr.php
++++ workspace/pages/dashboard_mgr.php
+@@ -1435,7 +1435,8 @@
+         $list.each(function() {
+             var text = $(this).text().toLowerCase();
+-            $(this).toggle(text.indexOf(searchTerm) > -1);
++            var isHiddenByDep = $(this).hasClass('hidden-by-dependency');
++            $(this).toggle(text.indexOf(searchTerm) > -1 && !isHiddenByDep);
+         });
+     });
+ 
+@@ -1480,6 +1481,28 @@
+         
+     });
+ 
++    table.on('draw', function() {
++        var filterCols = [2, 3, 6, 8];
++        filterCols.forEach(function(colIdx) {
++            var visibleSet = new Set();
++            table.cells(null, colIdx, { search: 'applied' }).every(function() {
++                var val = this.render('filter');
++                if (val) visibleSet.add(val.toString().trim());
++            });
++            var $dropdown = $('.apply-filter[data-col="'+colIdx+'"]').closest('.filter-dropdown');
++            var searchTerm = $dropdown.find('.dropdown-search').val().toLowerCase();
++            $dropdown.find('.checkbox-list label').each(function() {
++                var $cb = $(this).find('.col-checkbox');
++                var val = $cb.val();
++                var isVisibleDep = visibleSet.has(val) || $cb.prop('checked');
++                $(this).toggleClass('hidden-by-dependency', !isVisibleDep);
++                
++                var isHiddenBySearch = searchTerm && $(this).text().toLowerCase().indexOf(searchTerm) === -1;
++                $(this).toggle(isVisibleDep && !isHiddenBySearch);
++            });
++        });
++    });
++
+     $('#waModal .close-wa-btn').on('click', function() {
+         $('#waModal').addClass('hidden');
+         waResetToReview();

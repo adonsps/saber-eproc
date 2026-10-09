@@ -1,0 +1,36 @@
+graph TD
+    subgraph VSS[VSS Portal - Vendor Facing]
+        direction TB
+        V_Auth[Vendor Auth & Onboarding]
+        V_Profile[Profile & Catalog Management]
+        V_PQ[Pre-Qualification Submission]
+        V_RFQ[Quotation Submission]
+        V_Sample[Sample Request Acknowledgement]
+        V_AI[AI Document & Classification]
+    end
+
+    subgraph Workspace[Workspace - Internal Facing]
+        direction TB
+        W_Config[Config: Master Data, PGroup Setup]
+        W_Dash[Dashboard & Announcements]
+        W_Ops[Operations: PR Upload, AI Assignment, Eval]
+        W_Source[Sourcing: Create RFQ, Monitoring, Awards]
+        W_AON[AON: Master Agreements, Repeat Alerts]
+        W_Analytics[Analytics: Cost Savings, Avoidance, SLA]
+    end
+    
+    %% Cross-communication & Workflow
+    W_Config -.->|Master Data drives classification| VSS
+    W_Config -.->|Master Data drives matching| W_Ops
+    
+    V_PQ -->|Submitted PQ feeds Vendor Evals| W_Ops
+    
+    W_Ops -->|Approved & Assigned PRs feed| W_Source
+    W_Source -->|Sends RFQs out to| V_RFQ
+    V_RFQ -->|Bids returned for comparison| W_Source
+    
+    W_Source -->|Awarded Pricing feeds| W_AON
+    W_AON -->|Contracts prevent Maverick Spend in| W_Ops
+    
+    W_Source -.->|Savings data feeds| W_Analytics
+    W_Ops -.->|Turnaround times feed SLA| W_Analytics

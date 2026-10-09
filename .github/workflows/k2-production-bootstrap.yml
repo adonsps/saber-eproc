@@ -1,0 +1,336 @@
+name: K2 Production Bootstrap (manual, read-only verification)
+
+# Manual-only. Never runs on push or pull_request.
+#
+# Scope (see db_backups/k2_drive_automation_migration_readme.md and
+# apps-script/k2-drive-import/README.md for background):
+#   1. Upsert the three K2 automation env values into /var/www/vms/.env on
+#      the VPS, without disturbing any unrelated entry.
+#   2. Recreate only the `app` service so it picks up the new environment.
+#   3. Run the existing K2 readiness checker inside the app container.
+#   4. Run read-only (SELECT/SHOW) inspection of the six K2 automation
+#      tables directly against the `db` container's own MySQL environment.
+#
+# This workflow never applies a migration, runs an import, starts the queue
+# worker, touches recovery/cron/Apps Script, or acts on any batch. It is
+# intentionally a bootstrap + verification tool only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type CONFIGURE_K2_PRODUCTION to proceed'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: k2-production-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # ----------------------------------------------------------------
+      # Step 0 — explicit confirmation gate. Must fail (not skip) the job
+      # so a mistyped/missing confirmation shows as a real failure.
+      # ----------------------------------------------------------------
+      - name: Require explicit confirmation
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.confirm }}" != "CONFIGURE_K2_PRODUCTION" ]; then
+            echo "::error::Confirmation input must be exactly CONFIGURE_K2_PRODUCTION. Aborting before any production action."
+            exit 1
+          fi
+          echo "Confirmation accepted."
+
+      # ----------------------------------------------------------------
+      # Step 1 — resolve K2_AUTOMATION_PUBLIC_API_BASE_PATH.
+      #
+      # apps-script/k2-drive-import/README.md deliberately keeps the real
+      # production endpoint URL out of source control, so it cannot be read
+      # from repo docs directly. What the repo DOES establish:
+      #   - db_backups/vendor_eval_v2_deployment_handover.txt documents the
+      #     production base URL as https://vssportal.online/vms/...
+      #   - the README's own worked example shows the shape
+      #     "<base>/workspace/api/k2_automation" and explicitly warns that
+      #     "/workspace/..." and "/vms/workspace/..." are NOT interchangeable.
+      # That leaves two plausible live candidates. Per instructions this is
+      # proven, not guessed: both are probed read-only (unauthenticated GET,
+      # no request body) and a non-404 response (401/403/405/etc., i.e. the
+      # route exists but rejected the unauthenticated/wrong-method probe) is
+      # treated as proof of existence. Ambiguous or all-404 results fail the
+      # job before any production file or container is touched.
+      # ----------------------------------------------------------------
+      - name: Resolve and prove K2 public API base path
+        run: |
+          set -euo pipefail
+          host="https://vssportal.online"
+          candidates=(
+            "/vms/workspace/api/k2_automation"
+            "/workspace/api/k2_automation"
+          )
+          proven=""
+          for path in "${candidates[@]}"; do
+            url="${host}${path}/batch_status.php"
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --connect-timeout 5 -X GET "$url" || echo 000)"
+            echo "Probed ${path} -> HTTP ${code}"
+            if [ "$code" != "404" ] && [ "$code" != "000" ]; then
+              if [ -n "$proven" ] && [ "$proven" != "$path" ]; then
+                echo "::error::Ambiguous route probe: both ${proven} and ${path} returned non-404 responses. Refusing to guess."
+                exit 1
+              fi
+              proven="$path"
+            fi
+          done
+          if [ -z "$proven" ]; then
+            echo "::error::Could not prove K2_AUTOMATION_PUBLIC_API_BASE_PATH: every candidate route returned 404 or was unreachable."
+            exit 1
+          fi
+          echo "Proven public API base path: ${proven}"
+          echo "K2_PUBLIC_API_BASE_PATH=${proven}" >> "$GITHUB_ENV"
+
+      # ----------------------------------------------------------------
+      # Step 2 — SSH setup. Reuses the exact secrets/connection settings
+      # already used by .github/workflows/deploy.yml (secrets.VPS_IP,
+      # secrets.VPS_SSH_KEY, user root, port 22) — no new VPS credentials
+      # are introduced.
+      # ----------------------------------------------------------------
+      - name: Set up SSH
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/k2_deploy_key
+          chmod 600 ~/.ssh/k2_deploy_key
+          ssh-keyscan -p 22 -H "${{ secrets.VPS_IP }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      # ----------------------------------------------------------------
+      # Step 3 — safe remote .env upsert. Only the three K2 keys are
+      # touched; every other line is preserved byte-for-byte. Secret
+      # values are handed to the remote shell as pre-quoted assignment
+      # lines (via printf %q) ahead of a single-quoted heredoc, so the
+      # heredoc body itself is never locally expanded and the values are
+      # never echoed anywhere.
+      # ----------------------------------------------------------------
+      - name: Upsert K2 env vars on VPS (values never printed)
+        env:
+          K2_CLIENT_ID: ${{ secrets.K2_AUTOMATION_CLIENT_ID }}
+          K2_HMAC_SECRET: ${{ secrets.K2_AUTOMATION_HMAC_SECRET }}
+          K2_BASE_PATH: ${{ env.K2_PUBLIC_API_BASE_PATH }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'K2_AUTOMATION_CLIENT_ID_VALUE=%q\n' "$K2_CLIENT_ID"
+            printf 'K2_AUTOMATION_HMAC_SECRET_VALUE=%q\n' "$K2_HMAC_SECRET"
+            printf 'K2_AUTOMATION_PUBLIC_API_BASE_PATH_VALUE=%q\n' "$K2_BASE_PATH"
+            cat <<'REMOTE_SCRIPT'
+          set -euo pipefail
+          umask 077
+
+          if [ ! -d /var/www/vms ]; then
+            echo "ERROR: /var/www/vms does not exist" >&2
+            exit 1
+          fi
+          cd /var/www/vms
+
+          if [ ! -f docker-compose.prod.yml ]; then
+            echo "ERROR: docker-compose.prod.yml not found in /var/www/vms" >&2
+            exit 1
+          fi
+
+          ts="$(date +%Y%m%d%H%M%S)"
+          if [ -f .env ]; then
+            backup_file=".env.bak.${ts}"
+            cp -p .env "${backup_file}"
+            chmod 600 "${backup_file}"
+            echo "Backup created: ${backup_file}"
+          else
+            : > .env
+            echo "No existing .env found; created a new empty one."
+          fi
+          chmod 600 .env
+
+          tmp_env="$(mktemp)"
+          chmod 600 "${tmp_env}"
+          cp .env "${tmp_env}"
+
+          for key in K2_AUTOMATION_CLIENT_ID K2_AUTOMATION_HMAC_SECRET K2_AUTOMATION_PUBLIC_API_BASE_PATH; do
+            grep -v -E "^${key}=" "${tmp_env}" > "${tmp_env}.filtered" || true
+            mv "${tmp_env}.filtered" "${tmp_env}"
+          done
+
+          tmp_new="$(mktemp)"
+          chmod 600 "${tmp_new}"
+          {
+            cat "${tmp_env}"
+            printf 'K2_AUTOMATION_CLIENT_ID=%s\n' "${K2_AUTOMATION_CLIENT_ID_VALUE}"
+            printf 'K2_AUTOMATION_HMAC_SECRET=%s\n' "${K2_AUTOMATION_HMAC_SECRET_VALUE}"
+            printf 'K2_AUTOMATION_PUBLIC_API_BASE_PATH=%s\n' "${K2_AUTOMATION_PUBLIC_API_BASE_PATH_VALUE}"
+          } > "${tmp_new}"
+          mv "${tmp_new}" .env
+          chmod 600 .env
+          rm -f "${tmp_env}"
+
+          echo "--- K2 env key presence (values withheld) ---"
+          for key in K2_AUTOMATION_CLIENT_ID K2_AUTOMATION_HMAC_SECRET K2_AUTOMATION_PUBLIC_API_BASE_PATH; do
+            if grep -q -E "^${key}=" .env; then
+              echo "${key}: PRESENT"
+            else
+              echo "${key}: MISSING"
+            fi
+          done
+
+          echo "--- .env ownership/permissions ---"
+          stat -c '%U:%G %a %n' .env
+          REMOTE_SCRIPT
+          } | ssh -i ~/.ssh/k2_deploy_key -p 22 root@"${{ secrets.VPS_IP }}" bash -s | tee env_upsert_output.txt
+
+      # ----------------------------------------------------------------
+      # Step 4 — recreate only the app container (db and phpmyadmin are
+      # never touched), then report container status.
+      # ----------------------------------------------------------------
+      - name: Recreate app container only
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/k2_deploy_key -p 22 root@"${{ secrets.VPS_IP }}" bash -s <<'REMOTE_SCRIPT' | tee app_recreate_output.txt
+          set -euo pipefail
+          cd /var/www/vms
+          docker compose -f docker-compose.prod.yml up -d --no-deps --force-recreate app
+          echo "--- docker compose ps ---"
+          docker compose -f docker-compose.prod.yml ps
+          REMOTE_SCRIPT
+
+      # ----------------------------------------------------------------
+      # Step 5 — K2 readiness check. The job fails at the end (see the
+      # final gate step) if this is not fully green, but we still run the
+      # DB inspection below regardless so the summary is complete either
+      # way.
+      # ----------------------------------------------------------------
+      - name: Run K2 automation readiness check
+        run: |
+          set +e
+          ssh -i ~/.ssh/k2_deploy_key -p 22 root@"${{ secrets.VPS_IP }}" bash -s <<'REMOTE_SCRIPT' > readiness_output.txt 2>&1
+          set -euo pipefail
+          cd /var/www/vms
+          docker compose -f docker-compose.prod.yml exec -T app php workspace/automation/check_k2_automation_readiness.php
+          REMOTE_SCRIPT
+          readiness_exit=$?
+          set -e
+          echo "READINESS_EXIT=${readiness_exit}" >> "$GITHUB_ENV"
+          cat readiness_output.txt
+
+      # ----------------------------------------------------------------
+      # Step 6 — read-only DB inspection. Deliberately does NOT load
+      # workspace/config/database.php (it performs schema/data writes on
+      # load). Credentials are the db container's own MYSQL_USER/
+      # MYSQL_PASSWORD environment (from docker-compose.prod.yml), read
+      # inside the container — never passed through this workflow. Only
+      # SELECT/SHOW statements are issued.
+      # ----------------------------------------------------------------
+      - name: Read-only K2 schema/database inspection
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/k2_deploy_key -p 22 root@"${{ secrets.VPS_IP }}" bash -s <<'REMOTE_SCRIPT' | tee db_inspection_output.txt
+          set -euo pipefail
+          cd /var/www/vms
+
+          run_query() {
+            local sql="$1"
+            docker compose -f docker-compose.prod.yml exec -T -e SQL_QUERY="$sql" db sh -c 'mysql -t -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -e "$SQL_QUERY"'
+          }
+
+          echo "--- @@version / @@version_comment ---"
+          run_query 'SELECT @@version, @@version_comment;'
+
+          echo "--- SHOW DATABASES ---"
+          run_query 'SHOW DATABASES;'
+
+          echo "--- K2 six-table existence (schema.table) ---"
+          table_rows="$(run_query 'SELECT table_name, table_schema FROM information_schema.tables WHERE table_name IN ("k2_automation_import_batches", "k2_automation_source_files", "k2_automation_import_batch_files", "k2_automation_operation_requests", "k2_automation_operation_attempts", "k2_automation_api_nonces") ORDER BY table_name;')"
+          echo "${table_rows}"
+          found_count="$(printf '%s\n' "${table_rows}" | grep -c '^| k2_automation_' || true)"
+          echo "K2_TABLE_COUNT=${found_count} (of 6 expected)"
+
+          echo "--- state / response_batch_state column types ---"
+          col_rows="$(run_query 'SELECT table_schema, table_name, column_name, column_type FROM information_schema.columns WHERE (table_name = "k2_automation_import_batches" AND column_name = "state") OR (table_name = "k2_automation_operation_requests" AND column_name = "response_batch_state");')"
+          echo "${col_rows}"
+
+          if printf '%s\n' "${col_rows}" | grep -q "AON_QUEUED"; then
+            echo "AON_QUEUED_SUPPORT=YES"
+          else
+            echo "AON_QUEUED_SUPPORT=NO"
+          fi
+          if printf '%s\n' "${col_rows}" | grep -q "PR_QUEUED"; then
+            echo "PR_QUEUED_SUPPORT=YES"
+          else
+            echo "PR_QUEUED_SUPPORT=NO"
+          fi
+
+          echo "--- confirmation: no migration/import/worker/cron/Apps Script/batch action was executed by this step ---"
+          echo "Only SELECT/SHOW information_schema queries and the version query above were run."
+          REMOTE_SCRIPT
+
+      # ----------------------------------------------------------------
+      # Step 7 — job summary.
+      # ----------------------------------------------------------------
+      - name: Build job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## K2 Production Bootstrap — Summary"
+            echo ""
+            echo "### 1. App container status"
+            echo '```'
+            cat app_recreate_output.txt 2>/dev/null || echo "(not captured)"
+            echo '```'
+            echo ""
+            echo "### 2. K2 environment presence (values withheld)"
+            echo '```'
+            cat env_upsert_output.txt 2>/dev/null || echo "(not captured)"
+            echo '```'
+            echo ""
+            echo "### 3. Readiness PASS/FAIL"
+            echo '```'
+            cat readiness_output.txt 2>/dev/null || echo "(not captured)"
+            echo "Exit code: ${READINESS_EXIT:-unknown}"
+            echo '```'
+            echo ""
+            echo "### 4-7. DB engine/version, schema, six-table existence, queued-state support"
+            echo '```'
+            cat db_inspection_output.txt 2>/dev/null || echo "(not captured)"
+            echo '```'
+            echo ""
+            echo "### 8. Next action if schema is absent or stale"
+            table_count_line="$(grep -o 'K2_TABLE_COUNT=[0-9]*' db_inspection_output.txt 2>/dev/null || echo 'K2_TABLE_COUNT=0')"
+            aon_line="$(grep -o 'AON_QUEUED_SUPPORT=[A-Z]*' db_inspection_output.txt 2>/dev/null || echo 'AON_QUEUED_SUPPORT=NO')"
+            pr_line="$(grep -o 'PR_QUEUED_SUPPORT=[A-Z]*' db_inspection_output.txt 2>/dev/null || echo 'PR_QUEUED_SUPPORT=NO')"
+            table_count="${table_count_line#K2_TABLE_COUNT=}"
+            if [ "${table_count}" != "6" ] || [ "${aon_line#AON_QUEUED_SUPPORT=}" != "YES" ] || [ "${pr_line#PR_QUEUED_SUPPORT=}" != "YES" ]; then
+              echo "Schema is absent or stale (${table_count_line}, ${aon_line}, ${pr_line}). This workflow will NOT apply a migration."
+              echo "Manual next step: follow db_backups/k2_drive_automation_migration_readme.md to apply the correct additive schema file(s) for this engine, after a full DB backup and explicit approval (see the db-apply-safety checklist), then re-run this workflow to re-verify."
+            else
+              echo "All six K2 tables present and AON_QUEUED/PR_QUEUED are supported. No schema action needed."
+            fi
+            echo ""
+            echo "### 9. Confirmation"
+            echo "No migration, import, queue worker, recovery run, archive action, cron change, Apps Script change, or batch action (register/retry/reset/claim/reuse) was performed by this workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ----------------------------------------------------------------
+      # Step 8 — final gate. Fails the job if readiness was not fully
+      # green, even though the summary above was already written.
+      # ----------------------------------------------------------------
+      - name: Fail if readiness was not fully green
+        run: |
+          set -euo pipefail
+          if [ "${READINESS_EXIT:-1}" != "0" ]; then
+            echo "::error::K2 automation readiness check did not pass (exit ${READINESS_EXIT:-unknown}). See the job summary for details."
+            exit 1
+          fi
+          echo "Readiness check passed."

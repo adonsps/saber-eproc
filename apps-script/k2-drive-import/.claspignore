@@ -1,0 +1,5 @@
+**/node_modules/**
+tests/**
+README.md
+.clasp.json
+.clasp.json.example

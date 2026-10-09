@@ -1,0 +1,45 @@
+name: Deploy to Production VPS
+
+on:
+  push:
+    branches:
+      - production
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.VPS_IP }}
+          username: root
+          key: ${{ secrets.VPS_SSH_KEY }}
+          # Use port 22 by default
+          port: 22
+          envs: GH_TOKEN
+          script: |
+            set -euo pipefail
+            # We assume you clone the repo to /var/www/vms on the server
+            cd /var/www/vms
+            
+            # Authenticate git pull using the temporary GitHub Actions token
+            git remote set-url origin https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git
+            
+            # Ensure we are on the production branch and pull latest changes
+            git fetch origin production
+            git checkout production
+            # Force the local branch to exactly match remote production, dropping any accidental local changes
+            git reset --hard origin/production
+            # Rebuild the app and start services
+            docker compose -f docker-compose.prod.yml up -d --build
+            # Nginx Proxy Manager resolves container hostnames once, at config load. A
+            # recreate can hand the containers different IPs, and NPM keeps sending
+            # traffic to the old ones -- on 2026-10-06 that put phpMyAdmin (auto-login)
+            # on vssportal.online. Reloading makes NPM resolve the names again.
+            docker exec npm-app-1 nginx -s reload || echo "WARN: could not reload npm-app-1 nginx; reload it by hand"
+            # Clean up old unused docker images to save space
+            docker image prune -f

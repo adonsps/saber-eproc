@@ -1,0 +1,520 @@
+<?php
+// pages/master_data.php
+require_once '../includes/auth.php';
+// We now allow all managers in, but restrict what they can do via $_SESSION['role']
+require_manager(); 
+require_once '../config/database.php';
+
+// DEKLARASIKAN VARIABEL DI SINI SEBELUM CEK POST
+$role = $_SESSION['role'] ?? '';
+$current_user = $_SESSION['name'] ?? '';
+
+// --- 2. HANDLE MANUAL / SUGGESTION UPDATES ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_pic'], $_POST['level_4_key'])) {
+    
+    $new_pic_names = '';
+    if (isset($_POST['pic_names_arr']) && is_array($_POST['pic_names_arr'])) {
+        $new_pic_names = implode(', ', array_map('trim', $_POST['pic_names_arr']));
+    }
+    
+    $level_4_key = $_POST['level_4_key']; 
+
+    if ($role === 'Category Manager') {
+        // Category Managers directly overwrite the mapping AND clear any pending suggestions
+        $updateStmt = $pdo->prepare("UPDATE master_data SET pic_names = ?, suggested_pic_names = NULL, suggested_by = NULL WHERE level_4 = ?");
+        $updateStmt->execute([$new_pic_names, $level_4_key]);
+        header("Location: master_data.php?manual_update=1");
+    } else {
+        // Standard Managers only log a suggestion
+        $updateStmt = $pdo->prepare("UPDATE master_data SET suggested_pic_names = ?, suggested_by = ? WHERE level_4 = ?");
+        $updateStmt->execute([$new_pic_names, $current_user, $level_4_key]);
+        header("Location: master_data.php?suggest_update=1");
+    }
+    exit;
+}
+
+require_once '../includes/header.php';
+
+$uploadMessage = '';
+
+// --- 1. HANDLE CSV UPLOAD (CATEGORY MANAGERS ONLY) ---
+if ($role === 'Category Manager' && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['taxonomy_file'])) {
+    $file = $_FILES['taxonomy_file'];
+    
+    if ($file['error'] === UPLOAD_ERR_OK) {
+        $ext = pathinfo($file['name'], PATHINFO_EXTENSION);
+        
+        if (strtolower($ext) === 'csv') {
+            $tmpPath = $file['tmp_name'];
+            $handle = fopen($tmpPath, "r");
+            
+            if ($handle !== FALSE) {
+                $insertedCount = 0;
+                $updatedCount = 0;
+                
+                fgetcsv($handle, 1000, ","); // Skip header
+                
+                // Note: We clear any pending suggestions if a CSV overwrites the row
+                $sql = "INSERT INTO master_data (level_0, level_1, level_2, level_3, level_4, pic_names) 
+                        VALUES (?, ?, ?, ?, ?, ?) 
+                        ON DUPLICATE KEY UPDATE 
+                        level_0 = VALUES(level_0), level_1 = VALUES(level_1), 
+                        level_2 = VALUES(level_2), level_3 = VALUES(level_3), 
+                        pic_names = VALUES(pic_names),
+                        suggested_pic_names = NULL, suggested_by = NULL";
+                
+                $stmt = $pdo->prepare($sql);
+                
+                while (($data = fgetcsv($handle, 1000, ",")) !== FALSE) {
+                    if (!isset($data[4]) || !isset($data[5]) || trim($data[4]) === '') {
+                        continue; 
+                    }
+                    
+                    $level_0 = isset($data[0]) ? trim($data[0]) : '';
+                    $level_1 = isset($data[1]) ? trim($data[1]) : '';
+                    $level_2 = isset($data[2]) ? trim($data[2]) : '';
+                    $level_3 = isset($data[3]) ? trim($data[3]) : '';
+                    $level_4 = trim($data[4]); 
+                    $pic_names = trim($data[5]);
+                    
+                    $stmt->execute([$level_0, $level_1, $level_2, $level_3, $level_4, $pic_names]);
+                    
+                    if ($stmt->rowCount() == 1) {
+                        $insertedCount++;
+                    } elseif ($stmt->rowCount() == 2) {
+                        $updatedCount++;
+                    }
+                }
+                fclose($handle);
+                
+                $uploadMessage = "<div class='bg-green-100 border-l-4 border-green-500 text-green-700 p-4 mb-6 shadow-sm rounded'>
+                    <p class='font-bold'>Knowledge Base Updated!</p>
+                    <p>Inserted $insertedCount new rules. Updated $updatedCount existing rules.</p>
+                </div>";
+            } else {
+                $uploadMessage = "<div class='bg-red-100 border-l-4 border-red-500 text-red-700 p-4 mb-6'>Could not read the CSV file.</div>";
+            }
+        } else {
+            $uploadMessage = "<div class='bg-red-100 border-l-4 border-red-500 text-red-700 p-4 mb-6'>Please upload a valid .csv file.</div>";
+        }
+    } else {
+        $uploadMessage = "<div class='bg-red-100 border-l-4 border-red-500 text-red-700 p-4 mb-6'>File upload error.</div>";
+    }
+}
+
+// --- 3. FETCH DATA FOR UI ---
+// SEKARANG MENGAMBIL LEVEL 0 JUGA DARI DATABASE
+$stmt = $pdo->query("SELECT level_0, level_1, level_2, level_3, level_4, pic_names, suggested_pic_names, suggested_by FROM master_data ORDER BY level_0, level_1, level_2, level_3, level_4");
+$taxonomy_data = $stmt->fetchAll();
+
+// Extract unique arrays for quick filters and column dropdowns (Level 0, 1, 2)
+$unique_level_0 = array_filter(array_unique(array_column($taxonomy_data, 'level_0')));
+$unique_level_1 = array_filter(array_unique(array_column($taxonomy_data, 'level_1')));
+$unique_level_2 = array_filter(array_unique(array_column($taxonomy_data, 'level_2')));
+sort($unique_level_0);
+sort($unique_level_1);
+sort($unique_level_2);
+
+$picStmt = $pdo->query("SELECT name FROM users WHERE role = 'PIC' ORDER BY name ASC");
+$all_pics = $picStmt->fetchAll(PDO::FETCH_COLUMN);
+?>
+
+<link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css">
+<script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+
+<div class="mb-6 flex justify-between items-end border-b pb-4">
+    <div>
+        <h2 class="text-2xl font-bold text-gray-800">Taxonomy Master Data</h2>
+        <?php if ($role === 'Category Manager'): ?>
+            <p class="text-gray-600">Category Manager Access: Manage AI routing rules and review team suggestions.</p>
+        <?php else: ?>
+            <p class="text-gray-600">Team View: View AI routing rules and suggest PIC changes to the Category Manager.</p>
+        <?php endif; ?>
+    </div>
+    <div class="flex space-x-3">
+        <a href="dashboard_mgr.php" class="bg-gray-500 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded transition shadow">&larr; Back</a>
+    </div>
+</div>
+
+<?= $uploadMessage ?>
+
+<?php if (isset($_GET['manual_update'])): ?>
+    <div class="bg-green-100 border-l-4 border-green-500 text-green-700 p-4 mb-6 shadow-sm rounded">
+        <p class="font-bold">Approved!</p>
+        <p>The routing rule was successfully updated in the AI Database.</p>
+    </div>
+<?php endif; ?>
+
+<?php if (isset($_GET['suggest_update'])): ?>
+    <div class="bg-blue-100 border-l-4 border-blue-500 text-blue-700 p-4 mb-6 shadow-sm rounded">
+        <p class="font-bold">Suggestion Submitted</p>
+        <p>Your suggested change has been sent to the Category Manager for approval.</p>
+    </div>
+<?php endif; ?>
+
+<?php if ($role === 'Category Manager'): ?>
+    <form action="master_data.php" method="POST" enctype="multipart/form-data" class="bg-white p-6 rounded-lg shadow-md border border-gray-200 mb-8">
+        <div class="flex items-end space-x-4">
+            <div class="flex-grow">
+                <label class="block text-gray-700 text-sm font-bold mb-2" for="taxonomy_file">
+                    Bulk Update: Upload Master Taxonomy File (.csv)
+                </label>
+                <input type="file" name="taxonomy_file" id="taxonomy_file" accept=".csv" required
+                       class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                <p class="text-xs text-gray-500 mt-2">Uploading a new file will automatically map and overwrite existing rules.</p>
+            </div>
+            <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-6 rounded focus:outline-none shadow transition duration-150 h-[42px] mb-[28px]">
+                Sync Database
+            </button>
+        </div>
+    </form>
+<?php endif; ?>
+
+<div class="mb-4">
+    <h3 class="text-sm font-bold text-gray-700 mb-2 uppercase tracking-wide">Filter by Category (Level 0)</h3>
+    <div class="flex flex-wrap gap-2">
+        <button type="button" class="team-filter-btn px-4 py-2 bg-indigo-50 text-indigo-700 font-bold rounded-lg shadow-sm border border-indigo-200 hover:bg-indigo-100 transition ring-2 ring-offset-2 ring-indigo-400 focus:outline-none" data-team="">
+            All Categories
+        </button>
+        <?php foreach ($unique_level_0 as $cat): ?>
+            <button type="button" class="team-filter-btn px-4 py-2 bg-white text-gray-600 font-bold rounded-lg shadow-sm border border-gray-200 hover:bg-gray-50 transition focus:outline-none" data-team="<?= htmlspecialchars($cat) ?>">
+                <?= htmlspecialchars($cat) ?>
+            </button>
+        <?php endforeach; ?>
+    </div>
+</div>
+
+<div class="mb-6 flex space-x-3 pt-2">
+    <button type="button" class="quick-filter-btn px-4 py-2 bg-gray-50 text-gray-700 font-bold rounded-lg shadow-sm border border-gray-200 hover:bg-gray-100 transition ring-2 ring-offset-2 ring-gray-400 focus:outline-none" data-status="">
+        View All Taxonomy
+    </button>
+    <button type="button" class="quick-filter-btn px-4 py-2 bg-yellow-50 text-yellow-700 font-bold rounded-lg shadow-sm border border-yellow-200 hover:bg-yellow-100 transition focus:outline-none" data-status="HasSuggestion">
+        🔔 Show Pending Suggestions
+    </button>
+</div>
+
+<div class="bg-white shadow-md rounded-lg border border-gray-200 mb-8">
+    <div class="overflow-y-auto px-6 pb-6 pt-2" style="max-height: 700px;">
+        <table id="masterTable" class="min-w-full leading-normal w-full text-left">
+            <thead>
+                <tr>
+                    <th class="th-filter bg-gray-100 px-4 py-3 border-b-2 border-gray-300 align-top shadow-sm min-w-[150px]">
+                        <div class="relative flex items-center justify-between mb-2">
+                            <div class="text-xs font-bold text-gray-600 uppercase tracking-wider">Level 0</div>
+                            <button type="button" class="filter-trigger text-gray-400 hover:text-indigo-600 p-1 rounded hover:bg-gray-200 transition"><svg class="h-4 w-4" fill="currentColor" viewBox="0 0 20 20"><path d="M3 3a1 1 0 011-1h12a1 1 0 011 1v3a1 1 0 01-.293.707L12 11.414V15a1 1 0 01-.293.707l-2 2A1 1 0 018 17v-5.586L3.293 6.707A1 1 0 013 6V3z"/></svg></button>
+                            <div class="filter-dropdown hidden absolute top-full left-0 mt-1 w-56 rounded-md shadow-xl bg-white ring-1 ring-black ring-opacity-5 z-50 border border-gray-200">
+                                <div class="p-2 border-b bg-white"><input type="text" class="dropdown-search w-full px-2 py-1 text-xs border border-gray-300 rounded" placeholder="Search..."></div>
+                                <div class="px-3 py-2 border-b bg-gray-50"><label class="text-[10px] flex items-center cursor-pointer text-indigo-600 font-bold"><input type="checkbox" class="select-all-checkbox mr-1"> Select All</label></div>
+                                <div class="p-2 max-h-48 overflow-y-auto checkbox-list">
+                                    <?php foreach ($unique_level_0 as $val): ?>
+                                    <label class="flex items-center p-1 hover:bg-indigo-50 rounded cursor-pointer"><input type="checkbox" class="col-checkbox h-3 w-3 text-indigo-600" value="<?= htmlspecialchars($val) ?>"><span class="ml-2 text-xs text-gray-700"><?= htmlspecialchars($val) ?></span></label>
+                                    <?php endforeach; ?>
+                                </div>
+                                <div class="p-2 border-t bg-gray-50 flex justify-end"><button type="button" class="clear-filter text-xs text-gray-500 mr-4">Clear</button><button type="button" data-col="0" class="apply-filter bg-indigo-600 text-white text-[10px] px-3 py-1 rounded">Apply</button></div>
+                            </div>
+                        </div>
+                    </th>
+                    <th class="th-filter bg-gray-100 px-4 py-3 border-b-2 border-gray-300 align-top shadow-sm min-w-[150px]">
+                        <div class="relative flex items-center justify-between mb-2">
+                            <div class="text-xs font-bold text-gray-600 uppercase tracking-wider">Level 1</div>
+                            <button type="button" class="filter-trigger text-gray-400 hover:text-indigo-600 p-1 rounded hover:bg-gray-200 transition"><svg class="h-4 w-4" fill="currentColor" viewBox="0 0 20 20"><path d="M3 3a1 1 0 011-1h12a1 1 0 011 1v3a1 1 0 01-.293.707L12 11.414V15a1 1 0 01-.293.707l-2 2A1 1 0 018 17v-5.586L3.293 6.707A1 1 0 013 6V3z"/></svg></button>
+                            <div class="filter-dropdown hidden absolute top-full left-0 mt-1 w-56 rounded-md shadow-xl bg-white ring-1 ring-black ring-opacity-5 z-50 border border-gray-200">
+                                <div class="p-2 border-b bg-white"><input type="text" class="dropdown-search w-full px-2 py-1 text-xs border border-gray-300 rounded" placeholder="Search..."></div>
+                                <div class="px-3 py-2 border-b bg-gray-50"><label class="text-[10px] flex items-center cursor-pointer text-indigo-600 font-bold"><input type="checkbox" class="select-all-checkbox mr-1"> Select All</label></div>
+                                <div class="p-2 max-h-48 overflow-y-auto checkbox-list">
+                                    <?php foreach ($unique_level_1 as $val): ?>
+                                    <label class="flex items-center p-1 hover:bg-indigo-50 rounded cursor-pointer"><input type="checkbox" class="col-checkbox h-3 w-3 text-indigo-600" value="<?= htmlspecialchars($val) ?>"><span class="ml-2 text-xs text-gray-700"><?= htmlspecialchars($val) ?></span></label>
+                                    <?php endforeach; ?>
+                                </div>
+                                <div class="p-2 border-t bg-gray-50 flex justify-end"><button type="button" class="clear-filter text-xs text-gray-500 mr-4">Clear</button><button type="button" data-col="1" class="apply-filter bg-indigo-600 text-white text-[10px] px-3 py-1 rounded">Apply</button></div>
+                            </div>
+                        </div>
+                    </th>
+                    <th class="th-filter bg-gray-100 px-4 py-3 border-b-2 border-gray-300 align-top shadow-sm min-w-[150px]">
+                        <div class="relative flex items-center justify-between mb-2">
+                            <div class="text-xs font-bold text-gray-600 uppercase tracking-wider">Level 2</div>
+                            <button type="button" class="filter-trigger text-gray-400 hover:text-indigo-600 p-1 rounded hover:bg-gray-200 transition"><svg class="h-4 w-4" fill="currentColor" viewBox="0 0 20 20"><path d="M3 3a1 1 0 011-1h12a1 1 0 011 1v3a1 1 0 01-.293.707L12 11.414V15a1 1 0 01-.293.707l-2 2A1 1 0 018 17v-5.586L3.293 6.707A1 1 0 013 6V3z"/></svg></button>
+                            <div class="filter-dropdown hidden absolute top-full left-0 mt-1 w-56 rounded-md shadow-xl bg-white ring-1 ring-black ring-opacity-5 z-50 border border-gray-200">
+                                <div class="p-2 border-b bg-white"><input type="text" class="dropdown-search w-full px-2 py-1 text-xs border border-gray-300 rounded" placeholder="Search..."></div>
+                                <div class="px-3 py-2 border-b bg-gray-50"><label class="text-[10px] flex items-center cursor-pointer text-indigo-600 font-bold"><input type="checkbox" class="select-all-checkbox mr-1"> Select All</label></div>
+                                <div class="p-2 max-h-48 overflow-y-auto checkbox-list">
+                                    <?php foreach ($unique_level_2 as $val): ?>
+                                    <label class="flex items-center p-1 hover:bg-indigo-50 rounded cursor-pointer"><input type="checkbox" class="col-checkbox h-3 w-3 text-indigo-600" value="<?= htmlspecialchars($val) ?>"><span class="ml-2 text-xs text-gray-700"><?= htmlspecialchars($val) ?></span></label>
+                                    <?php endforeach; ?>
+                                </div>
+                                <div class="p-2 border-t bg-gray-50 flex justify-end"><button type="button" class="clear-filter text-xs text-gray-500 mr-4">Clear</button><button type="button" data-col="2" class="apply-filter bg-indigo-600 text-white text-[10px] px-3 py-1 rounded">Apply</button></div>
+                            </div>
+                        </div>
+                    </th>
+                    <th class="th-filter bg-gray-100 px-4 py-3 border-b-2 border-gray-300 align-top shadow-sm min-w-[200px]">
+                        <div class="text-xs font-bold text-gray-600 uppercase tracking-wider mb-2">Level 3</div>
+                        <input type="text" data-col="3" class="column-search-text w-full px-2 py-1 text-xs border border-gray-300 rounded focus:ring-indigo-500 focus:border-indigo-500" placeholder="Search Level 3...">
+                    </th>
+                    <th class="th-filter bg-gray-100 px-4 py-3 border-b-2 border-gray-300 align-top shadow-sm min-w-[200px]">
+                        <div class="text-xs font-bold text-gray-600 uppercase tracking-wider mb-2">Level 4 (Unique Key)</div>
+                        <input type="text" data-col="4" class="column-search-text w-full px-2 py-1 text-xs border border-gray-300 rounded focus:ring-indigo-500 focus:border-indigo-500" placeholder="Search Level 4...">
+                    </th>
+                    <th class="th-filter bg-gray-100 px-4 py-3 border-b-2 border-gray-300 align-top shadow-sm min-w-[170px]">
+                        <div class="relative flex items-center justify-between mb-2">
+                            <div class="text-xs font-bold text-gray-600 uppercase tracking-wider">Assigned PIC(s)</div>
+                            <button type="button" class="filter-trigger text-gray-400 hover:text-indigo-600 p-1 rounded hover:bg-gray-200 transition"><svg class="h-4 w-4" fill="currentColor" viewBox="0 0 20 20"><path d="M3 3a1 1 0 011-1h12a1 1 0 011 1v3a1 1 0 01-.293.707L12 11.414V15a1 1 0 01-.293.707l-2 2A1 1 0 018 17v-5.586L3.293 6.707A1 1 0 013 6V3z"/></svg></button>
+                            <div class="filter-dropdown hidden absolute top-full right-0 mt-1 w-64 rounded-md shadow-xl bg-white ring-1 ring-black ring-opacity-5 z-50 border border-gray-200">
+                                <div class="p-2 border-b bg-white"><input type="text" class="dropdown-search w-full px-2 py-1 text-xs border border-gray-300 rounded" placeholder="Search..."></div>
+                                <div class="px-3 py-2 border-b bg-gray-50"><label class="text-[10px] flex items-center cursor-pointer text-indigo-600 font-bold"><input type="checkbox" class="select-all-checkbox mr-1"> Select All</label></div>
+                                <div class="p-2 max-h-48 overflow-y-auto checkbox-list">
+                                    <label class="flex items-center p-1 hover:bg-indigo-50 rounded cursor-pointer">
+                                        <input type="checkbox" class="col-checkbox h-3 w-3 text-indigo-600" value="HasSuggestion">
+                                        <span class="ml-2 text-xs text-yellow-600 font-bold">🔔 Has Suggestion</span>
+                                    </label>
+                                    <?php foreach ($all_pics as $pic): ?>
+                                    <label class="flex items-center p-1 hover:bg-indigo-50 rounded cursor-pointer"><input type="checkbox" class="col-checkbox h-3 w-3 text-indigo-600" value="<?= htmlspecialchars($pic) ?>"><span class="ml-2 text-xs text-gray-700"><?= htmlspecialchars($pic) ?></span></label>
+                                    <?php endforeach; ?>
+                                </div>
+                                <div class="p-2 border-t bg-gray-50 flex justify-end"><button type="button" class="clear-filter text-xs text-gray-500 mr-4">Clear</button><button type="button" data-col="5" class="apply-filter bg-indigo-600 text-white text-[10px] px-3 py-1 rounded">Apply</button></div>
+                            </div>
+                        </div>
+                    </th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($taxonomy_data as $row): ?>
+                    <?php $has_suggestion = !empty($row['suggested_pic_names']); ?>
+                    
+                    <tr class="hover:bg-indigo-50 transition border-b border-gray-100 <?= $has_suggestion ? 'bg-yellow-50/30' : '' ?>">
+                        <td class="px-4 py-3 text-sm font-semibold text-indigo-700"><?= htmlspecialchars($row['level_0'] ?: '-') ?></td>
+                        <td class="px-4 py-3 text-sm text-gray-700"><?= htmlspecialchars($row['level_1']) ?></td>
+                        <td class="px-4 py-3 text-sm text-gray-700"><?= htmlspecialchars($row['level_2']) ?></td>
+                        <td class="px-4 py-3 text-sm text-gray-700"><?= htmlspecialchars($row['level_3']) ?></td>
+                        <td class="px-4 py-3 text-sm font-medium text-gray-900"><?= htmlspecialchars($row['level_4']) ?></td>
+                        
+                        <td class="px-4 py-3 text-sm" data-search="<?= $has_suggestion ? 'HasSuggestion ' : '' ?><?= htmlspecialchars($row['pic_names']) ?>">
+                            <button type="button" 
+                                    class="open-modal-btn inline-flex items-center px-3 py-1.5 border border-gray-300 shadow-sm text-xs font-medium rounded text-indigo-700 bg-white hover:bg-indigo-50 focus:outline-none transition-colors mb-1"
+                                    data-l4="<?= htmlspecialchars($row['level_4']) ?>"
+                                    data-pics="<?= htmlspecialchars($row['pic_names']) ?>"
+                                    data-suggested="<?= htmlspecialchars($row['suggested_pic_names'] ?? '') ?>">
+                                
+                                <?= htmlspecialchars($row['pic_names'] ?: '-- Empty --') ?>
+                                
+                                <?php if ($role === 'Category Manager'): ?>
+                                    <svg class="ml-2 h-3 w-3 text-gray-400" fill="currentColor" viewBox="0 0 20 20"><path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zM11.379 5.793L3 14.172V17h2.828l8.38-8.379-2.83-2.828z"></path></svg>
+                                <?php else: ?>
+                                    <svg class="ml-2 h-3 w-3 text-yellow-500" fill="currentColor" viewBox="0 0 20 20"><path d="M11 3a1 1 0 10-2 0v1a1 1 0 102 0V3zM15.657 5.757a1 1 0 00-1.414-1.414l-.707.707a1 1 0 001.414 1.414l.707-.707zM18 10a1 1 0 01-1 1h-1a1 1 0 110-2h1a1 1 0 011 1zM5.05 6.464A1 1 0 106.464 5.05l-.707-.707a1 1 0 00-1.414 1.414l.707.707zM5 10a1 1 0 01-1 1H3a1 1 0 110-2h1a1 1 0 011 1zM8 16v-1h4v1a2 2 0 11-4 0zM12 14c.015-.34.208-.646.477-.859a4 4 0 10-4.954 0c.27.213.462.519.476.859h4.002z"></path></svg>
+                                <?php endif; ?>
+                            </button>
+
+                            <?php if ($has_suggestion): ?>
+                                <div class="mt-1 text-[10px] font-bold text-yellow-700 bg-yellow-100 border border-yellow-300 px-2 py-1 rounded inline-block">
+                                    Suggestion: <?= htmlspecialchars($row['suggested_pic_names'] ?: '-- Empty --') ?><br>
+                                    <span class="font-normal text-gray-500">By: <?= htmlspecialchars($row['suggested_by']) ?></span>
+                                </div>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div id="updateModal" class="fixed z-50 inset-0 hidden overflow-y-auto">
+  <div class="flex items-end justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
+    <div class="fixed inset-0 bg-gray-500 bg-opacity-75 transition-opacity backdrop-blur-sm" id="modalOverlay"></div>
+    <span class="hidden sm:inline-block sm:align-middle sm:h-screen">&#8203;</span>
+    <div class="inline-block align-bottom bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-md sm:w-full">
+      <form method="POST" action="">
+          <div class="bg-white px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
+            <div class="sm:flex sm:items-start">
+              
+              <?php if ($role === 'Category Manager'): ?>
+                  <div class="mx-auto flex-shrink-0 flex items-center justify-center h-12 w-12 rounded-full bg-indigo-100 sm:mx-0 sm:h-10 sm:w-10">
+                    <svg class="h-6 w-6 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
+                  </div>
+              <?php else: ?>
+                  <div class="mx-auto flex-shrink-0 flex items-center justify-center h-12 w-12 rounded-full bg-yellow-100 sm:mx-0 sm:h-10 sm:w-10">
+                    <svg class="h-6 w-6 text-yellow-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>
+                  </div>
+              <?php endif; ?>
+
+              <div class="mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left w-full">
+                <h3 class="text-lg font-medium text-gray-900">
+                    <?= $role === 'Category Manager' ? 'Update Routing Rule' : 'Suggest Routing Change' ?>
+                </h3>
+                <div class="mt-2">
+                  <p class="text-sm text-gray-500 mb-4">Edit the PIC assignment for: <strong id="modal-cat-display" class="text-indigo-600"></strong></p>
+                  
+                  <input type="hidden" name="level_4_key" id="modal-l4-input">
+                  <input type="hidden" name="update_pic" value="1">
+                  
+                  <label class="block text-xs font-bold text-gray-700 mb-2 uppercase tracking-wide">Assign PIC(s)</label>
+                  <div class="border border-gray-300 rounded-md overflow-hidden bg-white shadow-sm">
+                      <div class="p-2 border-b bg-gray-50">
+                          <input type="text" id="modal-pic-search" class="w-full px-3 py-1.5 text-sm border border-gray-300 rounded focus:ring-indigo-500 focus:border-indigo-500" placeholder="Search PIC name...">
+                      </div>
+                      <div class="max-h-48 overflow-y-auto p-2" id="modal-pic-list">
+                          <?php foreach ($all_pics as $pic): ?>
+                              <label class="flex items-center p-2 hover:bg-indigo-50 rounded cursor-pointer transition-colors border-b border-gray-50 last:border-0">
+                                  <input type="checkbox" name="pic_names_arr[]" value="<?= htmlspecialchars($pic) ?>" class="modal-pic-checkbox h-4 w-4 text-indigo-600 rounded border-gray-300 focus:ring-indigo-500">
+                                  <span class="ml-3 text-sm text-gray-700 font-medium pic-name-label"><?= htmlspecialchars($pic) ?></span>
+                              </label>
+                          <?php endforeach; ?>
+                      </div>
+                  </div>
+                  
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="bg-gray-50 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
+            <button type="submit" class="w-full inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 <?= $role === 'Category Manager' ? 'bg-indigo-600 hover:bg-indigo-700' : 'bg-yellow-500 hover:bg-yellow-600' ?> text-base font-medium text-white sm:ml-3 sm:w-auto sm:text-sm">
+                <?= $role === 'Category Manager' ? 'Save Rule' : 'Submit Suggestion' ?>
+            </button>
+            <button type="button" id="closeModalBtn" class="mt-3 w-full inline-flex justify-center rounded-md border border-gray-300 shadow-sm px-4 py-2 bg-white text-base font-medium text-gray-700 hover:bg-gray-50 sm:mt-0 sm:ml-3 sm:w-auto sm:text-sm">Cancel</button>
+          </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script>
+    $(document).ready(function() {
+        var table = $('#masterTable').DataTable({
+            "pageLength": 50,
+            "language": { "search": "Global Search:" },
+            "orderCellsTop": true // VERY IMPORTANT for complex headers
+        });
+
+        // 1. FILTER: Team Filter Buttons (Sekarang menggunakan Level 0)
+        $('.team-filter-btn').on('click', function() {
+            var team = $(this).data('team');
+            
+            // Visual feedback
+            $('.team-filter-btn').removeClass('ring-2 ring-offset-2 ring-indigo-400 bg-indigo-50 text-indigo-700').addClass('bg-white text-gray-600 border-gray-200');
+            $(this).removeClass('bg-white text-gray-600 border-gray-200').addClass('ring-2 ring-offset-2 ring-indigo-400 bg-indigo-50 text-indigo-700');
+
+            // Apply filter to Level 0 (Col 0)
+            if (team === '') {
+                table.column(0).search('', false, false).draw();
+            } else {
+                table.column(0).search('^' + $.fn.dataTable.util.escapeRegex(team) + '$', true, false).draw();
+            }
+        });
+
+        // 2. FILTER: Suggestion Quick Filters
+        $('.quick-filter-btn').on('click', function() {
+            var status = $(this).data('status');
+            $('.quick-filter-btn').removeClass('ring-2 ring-offset-2 ring-gray-400 ring-yellow-400');
+            $(this).addClass('ring-2 ring-offset-2 ' + (status === '' ? 'ring-gray-400' : 'ring-yellow-400'));
+
+            // Column 5 adalah kolom Assigned PIC(s) sekarang, bukan lagi 4.
+            table.column(5).search(status).draw();
+        });
+
+        // 3. DATATABLES: Dropdown Column Filters Logic
+        $('.column-search-text').on('keyup change clear', function(e) {
+            e.stopPropagation();
+            table.column($(this).data('col')).search(this.value).draw();
+        });
+
+        $('.filter-trigger').on('click', function(e) {
+            e.stopPropagation();
+            var $th = $(this).closest('th.th-filter');
+            var $dropdown = $(this).next('.filter-dropdown');
+            $('th.th-filter').css('z-index', '10');
+            $('.filter-dropdown').not($dropdown).addClass('hidden');
+
+            if ($dropdown.hasClass('hidden')) {
+                $dropdown.removeClass('hidden');
+                $th.css('z-index', '50');
+            } else {
+                $dropdown.addClass('hidden');
+            }
+        });
+
+        $(document).on('click', function() { $('.filter-dropdown').addClass('hidden'); $('th.th-filter').css('z-index', '10'); });
+        $('.filter-dropdown').on('click', function(e) { e.stopPropagation(); });
+        $('thead input').on('click', function(e) { e.stopPropagation(); });
+
+        $('.dropdown-search').on('keyup', function() {
+            var searchTerm = $(this).val().toLowerCase();
+            var $list = $(this).closest('.filter-dropdown').find('.checkbox-list label');
+            $list.each(function() {
+                var text = $(this).text().toLowerCase();
+                $(this).toggle(text.indexOf(searchTerm) > -1);
+            });
+        });
+
+        $('.select-all-checkbox').on('change', function() {
+            var isChecked = $(this).prop('checked');
+            $(this).closest('.filter-dropdown').find('.checkbox-list label:visible .col-checkbox').prop('checked', isChecked);
+        });
+
+        $('.apply-filter').on('click', function() {
+            var colIdx = $(this).data('col');
+            var $dropdown = $(this).closest('.filter-dropdown');
+            var selected = [];
+            $dropdown.find('.col-checkbox:checked').each(function() { selected.push($.fn.dataTable.util.escapeRegex($(this).val())); });
+
+            if (selected.length === 0) {
+                table.column(colIdx).search('', false, false).draw();
+            } else {
+                table.column(colIdx).search('^(' + selected.join('|') + ')$', true, false).draw();
+            }
+            $dropdown.addClass('hidden');
+            $('th.th-filter').css('z-index', '10');
+        });
+
+        $('.clear-filter').on('click', function() {
+            var $dropdown = $(this).closest('.filter-dropdown');
+            var colIdx = $dropdown.find('.apply-filter').data('col');
+            $dropdown.find('.col-checkbox, .select-all-checkbox').prop('checked', false);
+            $dropdown.find('.dropdown-search').val('').trigger('keyup');
+            table.column(colIdx).search('', false, false).draw();
+            $dropdown.addClass('hidden');
+            $('th.th-filter').css('z-index', '10');
+        });
+
+        // 4. MODAL LOGIC
+        const modal = $('#updateModal');
+        
+        $('#masterTable tbody').on('click', '.open-modal-btn', function() {
+            $('#modal-l4-input').val($(this).data('l4'));
+            $('#modal-cat-display').text($(this).data('l4'));
+            
+            $('#modal-pic-search').val('').trigger('keyup');
+            $('.modal-pic-checkbox').prop('checked', false);
+            
+            var suggestedStr = $(this).data('suggested');
+            var currentStr = $(this).data('pics');
+            
+            var picsToLoad = suggestedStr && <?= $role === 'Category Manager' ? 'true' : 'false' ?> ? suggestedStr : currentStr;
+            
+            if (picsToLoad) {
+                var picArray = String(picsToLoad).split(',').map(item => item.trim());
+                
+                $('.modal-pic-checkbox').each(function() {
+                    if (picArray.includes($(this).val())) {
+                        $(this).prop('checked', true);
+                    }
+                });
+            }
+            
+            modal.removeClass('hidden');
+        });
+
+        $('#modal-pic-search').on('keyup', function() {
+            var searchTerm = $(this).val().toLowerCase();
+            $('#modal-pic-list label').each(function() {
+                var text = $(this).find('.pic-name-label').text().toLowerCase();
+                $(this).toggle(text.indexOf(searchTerm) > -1);
+            });
+        });
+
+        $('#closeModalBtn, #modalOverlay').on('click', function() {
+            modal.addClass('hidden');
+        });
+    });
+</script>
+
+<?php require_once '../includes/footer.php'; ?>

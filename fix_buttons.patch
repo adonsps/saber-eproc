@@ -1,0 +1,65 @@
+--- workspace/pages/dashboard_mgr.php
++++ workspace/pages/dashboard_mgr.php
+@@ -1354,7 +1354,7 @@
+     // ===== QUICK FILTERS (STATUS, TYPE, TEAM) ===============================
+ 
+     $('.status-filter-btn').on('click', function() {
+-        $('.status-filter-btn').removeClass('bg-indigo-600 bg-red-600 bg-yellow-500 bg-green-600 bg-violet-600 text-white border-indigo-600 border-red-600 border-yellow-500 border-green-600 border-violet-600 ring-2 ring-offset-2').addClass('bg-white text-gray-700 border-gray-200');
++        $('.status-filter-btn').removeClass('bg-indigo-600 bg-red-600 bg-yellow-500 bg-green-600 bg-violet-600 hover:bg-indigo-700 hover:bg-red-700 hover:bg-yellow-600 hover:bg-green-700 hover:bg-violet-700 text-white border-indigo-600 border-red-600 border-yellow-500 border-green-600 border-violet-600 shadow-md ring-2 ring-offset-2').addClass('bg-white text-gray-700 border-gray-200 hover:bg-gray-50');
+         
+         var status = $(this).data('status');
+         var filter = $(this).data('filter');
+         
+         if (filter === 'manual-only') {
+             currentStatusFilter = 'manual-only';
+-            $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-violet-600 text-white border-violet-600 shadow-md ring-2 ring-offset-2');
++            $(this).removeClass('bg-white text-gray-700 border-gray-200 hover:bg-gray-50').addClass('bg-violet-600 hover:bg-violet-700 text-white border-violet-600 shadow-md ring-2 ring-offset-2');
+         } else {
+             currentStatusFilter = status || '';
+             if (status === 'Outstanding') {
+-                $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-red-600 text-white border-red-600 shadow-md ring-2 ring-offset-2');
++                $(this).removeClass('bg-white text-gray-700 border-gray-200 hover:bg-gray-50').addClass('bg-red-600 hover:bg-red-700 text-white border-red-600 shadow-md ring-2 ring-offset-2');
+             } else if (status === 'On Progress') {
+-                $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-yellow-500 text-white border-yellow-500 shadow-md ring-2 ring-offset-2');
++                $(this).removeClass('bg-white text-gray-700 border-gray-200 hover:bg-gray-50').addClass('bg-yellow-500 hover:bg-yellow-600 text-white border-yellow-500 shadow-md ring-2 ring-offset-2');
+             } else if (status === 'PO Created') {
+-                $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-green-600 text-white border-green-600 shadow-md ring-2 ring-offset-2');
++                $(this).removeClass('bg-white text-gray-700 border-gray-200 hover:bg-gray-50').addClass('bg-green-600 hover:bg-green-700 text-white border-green-600 shadow-md ring-2 ring-offset-2');
+             } else {
+                 currentStatusFilter = '';
+-                $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-indigo-600 text-white border-indigo-600 shadow-md ring-2 ring-offset-2');
++                $(this).removeClass('bg-white text-gray-700 border-gray-200 hover:bg-gray-50').addClass('bg-indigo-600 hover:bg-indigo-700 text-white border-indigo-600 shadow-md ring-2 ring-offset-2');
+             }
+         }
+         table.draw();
+     });
+ 
+     $('.type-filter-btn').on('click', function() {
+-        $('.type-filter-btn').removeClass('bg-indigo-600 bg-teal-600 bg-blue-600 text-white border-indigo-600 border-teal-600 border-blue-600 ring-2 ring-offset-2').addClass('bg-white text-gray-700 border-gray-200');
++        $('.type-filter-btn').removeClass('bg-indigo-600 bg-teal-600 bg-blue-600 hover:bg-indigo-700 hover:bg-teal-700 hover:bg-blue-700 text-white border-indigo-600 border-teal-600 border-blue-600 shadow-md ring-2 ring-offset-2').addClass('bg-white text-gray-700 border-gray-200 hover:bg-gray-50');
+         
+         var type = $(this).data('type');
+         currentTypeFilter = type || '';
+         
+         if (type === 'intercompany') {
+-            $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-teal-600 text-white border-teal-600 shadow-md ring-2 ring-offset-2');
++            $(this).removeClass('bg-white text-gray-700 border-gray-200 hover:bg-gray-50').addClass('bg-teal-600 hover:bg-teal-700 text-white border-teal-600 shadow-md ring-2 ring-offset-2');
+         } else if (type === 'non-intercompany') {
+-            $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-blue-600 text-white border-blue-600 shadow-md ring-2 ring-offset-2');
++            $(this).removeClass('bg-white text-gray-700 border-gray-200 hover:bg-gray-50').addClass('bg-blue-600 hover:bg-blue-700 text-white border-blue-600 shadow-md ring-2 ring-offset-2');
+         } else {
+             currentTypeFilter = '';
+-            $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-indigo-600 text-white border-indigo-600 shadow-md ring-2 ring-offset-2');
++            $(this).removeClass('bg-white text-gray-700 border-gray-200 hover:bg-gray-50').addClass('bg-indigo-600 hover:bg-indigo-700 text-white border-indigo-600 shadow-md ring-2 ring-offset-2');
+         }
+         table.draw();
+     });
+ 
+     $('.team-filter-btn').on('click', function() {
+-        $('.team-filter-btn').removeClass('bg-indigo-600 text-white border-indigo-600 ring-2 ring-offset-2').addClass('bg-white text-gray-700 border-gray-200');
+-        $(this).removeClass('bg-white text-gray-700 border-gray-200').addClass('bg-indigo-600 text-white border-indigo-600 ring-2 ring-offset-2');
++        $('.team-filter-btn').removeClass('bg-indigo-600 hover:bg-indigo-700 text-white border-indigo-600 shadow-md ring-2 ring-offset-2').addClass('bg-white text-gray-700 border-gray-200 hover:bg-gray-50');
++        $(this).removeClass('bg-white text-gray-700 border-gray-200 hover:bg-gray-50').addClass('bg-indigo-600 hover:bg-indigo-700 text-white border-indigo-600 shadow-md ring-2 ring-offset-2');
+         var grp = $(this).data('group');
+         var npteam = $(this).data('npteam');
+         if (npteam !== undefined && npteam !== '') {

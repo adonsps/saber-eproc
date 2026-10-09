@@ -1,0 +1,5 @@
+{
+    "require": {
+        "openspout/openspout": "^4.28"
+    }
+}

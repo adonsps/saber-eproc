@@ -1,0 +1,78 @@
+# Ignore database dumps (prevent uploading large sensitive SQL dumps)
+sql/
+*.sql
+!db_backups/*.sql
+
+# Docker DB init scripts are safe to commit: they read credentials from env vars
+# (see .env.example) and contain no hardcoded secrets. Does not un-ignore *.sql.
+!db_migrations/*.sh
+
+# Local runtime import/export working files (raw CSVs + generated reports; never committed)
+db_backups/local_runtime_imports/
+db_backups/local_runtime_exports/
+# Local pre-change DB backups (per-machine dumps, may contain password hashes; never committed)
+db_backups/local_runtime_backups/
+
+# Ignore local configuration files
+.env
+.env.local
+.env.*.local
+workspace/.htaccess
+
+# Vendor Eval v2 — feature-specific Fonnte token/device (never committed; see
+# workspace/config/vendor_eval_fonnte.local.php.example for the expected shape)
+workspace/config/vendor_eval_fonnte.local.php
+
+# Shared SMTP mailbox credential for a checkout with no docker-compose environment
+# (see includes/mail_secrets.local.php.example); never committed
+includes/mail_secrets.local.php
+
+# Local Docker Compose overrides (per-machine port remaps etc.; never committed)
+docker-compose.override.yml
+
+# Local Claude Code context file (machine-specific notes; never committed)
+CLAUDE.md
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.gdoc
+
+
+# Ignore local setup/reset utility scripts containing credentials
+setup_internal_users.php
+setup_test_vendor.php
+updatePasswordTemporary.php
+reset_sourcing.php
+reset_vm.php
+workspace/temp_setup_users.php
+default.php.old.php
+workspace/includes/email_error_debug.txt
+workspace/includes/wa_send_debug.txt
+workspace/test_db.php
+
+uploads/*
+!uploads/.gitkeep
+
+# Workspace upload directory (runtime files, not for repo)
+workspace/uploads/**
+!workspace/uploads/.gitkeep
+
+# Deployment artifacts
+announcement_center_deploy.zip
+deploy_announcement_center/
+
+# clasp (Google Apps Script CLI) machine-specific local config — contains an
+# absolute rootDir path; see apps-script/k2-drive-import/.clasp.json.example
+apps-script/**/.clasp.json
+storage/*
+!storage/.gitkeep
+
+# Undangan vendor yang disiapkan untuk kirim manual (tools/prepare_manual_invite.php).
+# Berisi invite_token per undangan — jangan ikut ter-commit.
+tools/manual_invites/

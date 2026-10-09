@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 44" width="220" height="44">
+  <defs>
+    <linearGradient id="cyanH" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00D8FF"/>
+      <stop offset="100%" stop-color="#0090FF"/>
+    </linearGradient>
+  </defs>
+  <!-- Saber Dual-Blade Emblem -->
+  <g transform="translate(2, 4) scale(0.24)">
+    <!-- Top Blade -->
+    <path d="M 12 40 C 35 15, 129 15, 152 40 C 120 48, 44 48, 12 40 Z" fill="#0F1E36"/>
+    <!-- Middle Cyan Core Pill -->
+    <rect x="46" y="68" width="72" height="16" rx="8" fill="url(#cyanH)"/>
+    <!-- Bottom Blade -->
+    <path d="M 12 112 C 44 104, 120 104, 152 112 C 129 137, 35 137, 12 112 Z" fill="#0F1E36"/>
+  </g>
+  <!-- Text -->
+  <g transform="translate(48, 29)">
+    <text font-family="'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="900" font-size="20" fill="#0F1E36" letter-spacing="-0.3px">SABER</text>
+    <text x="74" font-family="'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="800" font-size="20" fill="#0090FF" letter-spacing="-0.3px"> eProc</text>
+  </g>
+</svg>

@@ -1,0 +1,99 @@
+# docker-compose.yml for VSS and Workspace Pro
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8080:80"
+    volumes:
+      - .:/var/www/html # Syncs local edits instantly to container
+      # App code computes upload paths as "../uploads" relative to the html
+      # root (one level "above" /var/www/html) — but per the repo's actual
+      # committed scheme (see uploads/ at the repo root), uploads physically
+      # live at the project root. Mount the same host folder at both
+      # locations so the code's runtime path and the repo's on-disk scheme
+      # point at the same directory.
+      - ./uploads:/var/www/uploads
+      # Local-only: re-enable on-screen PHP errors. The image ships with
+      # display_errors=Off for production safety (see Dockerfile); this override
+      # loads last in conf.d (zz- prefix) and wins in dev. Not mounted by
+      # docker-compose.prod.yml, so production stays Off.
+      - ./docker/php-dev.ini:/usr/local/etc/php/conf.d/zz-php-dev.ini
+    depends_on:
+      - db
+    environment:
+      - DB_HOST=db
+      # Nightly VSS backup sender (backups/backup.php) — dev-only wiring so
+      # `docker-compose exec app php backups/backup.php` can be dry-run
+      # tested against a local receiver. Values come from .env; blank is
+      # fine (backup.php just fails loudly if it's ever actually invoked
+      # without them configured).
+      - VSS_BACKUP_RECEIVER_URL=${VSS_BACKUP_RECEIVER_URL:-}
+      - VSS_BACKUP_RECEIVER_SECRET=${VSS_BACKUP_RECEIVER_SECRET:-}
+      # Gemini AI — per-feature keys (see .env.example for the full mapping).
+      # Blank-safe here: an unset value means the corresponding feature
+      # throws "Gemini API key not configured" the first time it's used, it
+      # does not block the container from starting.
+      - AI_PO_TAXONOMY_API_KEY=${AI_PO_TAXONOMY_API_KEY:-}
+      - AI_TICKET_ASSIGN_API_KEY=${AI_TICKET_ASSIGN_API_KEY:-}
+      - AI_SKU_API_KEY=${AI_SKU_API_KEY:-}
+      - AI_VENDOR_SUGGEST_API_KEY=${AI_VENDOR_SUGGEST_API_KEY:-}
+      - AI_SLA_CHAT_API_KEY=${AI_SLA_CHAT_API_KEY:-}
+      - AI_ADMIN_MISC_API_KEY=${AI_ADMIN_MISC_API_KEY:-}
+      - AI_VENDOR_DOC_EXTRACT_API_KEY=${AI_VENDOR_DOC_EXTRACT_API_KEY:-}
+      - AI_VENDOR_PROJECT_VALIDATE_API_KEY=${AI_VENDOR_PROJECT_VALIDATE_API_KEY:-}
+      - AI_VENDOR_BIZ_SUGGEST_API_KEY=${AI_VENDOR_BIZ_SUGGEST_API_KEY:-}
+      - AI_VENDOR_PROFILE_SUMMARY_API_KEY=${AI_VENDOR_PROFILE_SUMMARY_API_KEY:-}
+      # VSS DB credential rotation hook (see .env.example) — defaults match
+      # today's hardcoded credential exactly, so leaving these unset in dev's
+      # .env changes nothing.
+      - VSS_DB_NAME=${VSS_DB_NAME:-u894129685_vmsportal}
+      - VSS_DB_USER=${VSS_DB_USER:-u894129685_adonisvm}
+      - VSS_DB_PASSWORD=${VSS_DB_PASSWORD:-Xcel007!}
+      # Mail send-rate guardrail (includes/mail_rate_limiter.php). Blank-safe:
+      # the code's built-in defaults (15 recipient-slots / 5 min, 60 / hour)
+      # apply when these are unset.
+      # Shared SMTP mailbox (includes/mail_config.php) -- Google Workspace,
+      # replacing the Hostinger-restricted corporateprocurement@vssportal.online.
+      # Password (a Google App Password) comes from the untracked .env beside
+      # this file. SMTP_FROM_EMAIL blank => the From follows SMTP_USERNAME.
+      - SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+      - SMTP_PORT=${SMTP_PORT:-465}
+      - SMTP_USERNAME=${SMTP_USERNAME:-sigit.ramadan@kawanlamacorp.com}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - SMTP_FROM_EMAIL=${SMTP_FROM_EMAIL:-}
+      - SMTP_FROM_NAME=${SMTP_FROM_NAME:-Saber eProc}
+      - MAIL_RATE_LIMIT_BURST=${MAIL_RATE_LIMIT_BURST:-}
+      - MAIL_RATE_LIMIT_HOURLY=${MAIL_RATE_LIMIT_HOURLY:-}
+      # Reminder Vendor Migrasi bulk send: OFF unless set to 1 (includes/migrated_reminder_helper.php).
+      - MIGRATED_REMINDER_SEND_ENABLED=${MIGRATED_REMINDER_SEND_ENABLED:-0}
+      - MIGRATED_REMINDER_DAILY_CAP=${MIGRATED_REMINDER_DAILY_CAP:-}
+
+  db:
+    image: mysql:8.0
+    command: --default-authentication-plugin=mysql_native_password
+    restart: always
+    ports:
+      - "3306:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-change_me}
+      - WORKSPACE_DB_PASSWORD=${WORKSPACE_DB_PASSWORD:-change_me}
+      - VMSPORTAL_DB_PASSWORD=${VMSPORTAL_DB_PASSWORD:-change_me}
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./db_migrations:/docker-entrypoint-initdb.d
+
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    ports:
+      - "8082:80"
+    environment:
+      - PMA_HOST=db
+    depends_on:
+      - db
+
+volumes:
+  db_data:
+    external: true
+    name: workspace_db_data
