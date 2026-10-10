@@ -27,6 +27,7 @@ if (in_array($user_role, ['Category Manager', 'Manager'])) {
     $dashboard_link = 'dashboard_mgr.php';
 }
 
+$show_create_pr = in_array($user_role, ['Technical Department', 'Category Manager', 'Manager', 'Admin'], true);
 $show_upload_pr = ($user_role === 'Category Manager');
 $show_vendor_eval_v2_results = in_array($user_role, ['Category Manager', 'Manager']);
 // Read-only Vendor Evaluation results link for external Technical Department
@@ -222,11 +223,18 @@ if ($show_sla_approvals && isset($pdo) && $pdo instanceof PDO) {
                 </div>
                 <?php endif; ?>
 
-                <?php if ($show_upload_pr || $show_vendor_eval_v2_results || $show_vendor_eval_tech): ?>
+                <?php if ($show_create_pr || $show_upload_pr || $show_vendor_eval_v2_results || $show_vendor_eval_tech): ?>
                 <div>
                     <p class="px-3 text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">Operations</p>
+                    <?php if ($show_create_pr): ?>
+                    <a href="pr_create.php" class="flex items-center px-3 py-2 text-sm font-medium text-slate-600 rounded-lg hover:bg-blue-50 hover:text-blue-800 transition-colors">
+                        <svg class="w-5 h-5 mr-3 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                        <span>Create PR Direct</span>
+                    </a>
+                    <?php endif; ?>
+
                     <?php if ($show_upload_pr): ?>
-                    <a href="upload_pr.php" class="flex items-center px-3 py-2 text-sm font-medium text-slate-600 rounded-lg hover:bg-blue-50 hover:text-blue-800 transition-colors">
+                    <a href="upload_pr.php" class="flex items-center px-3 py-2 text-sm font-medium text-slate-600 rounded-lg hover:bg-blue-50 hover:text-blue-800 transition-colors mt-1">
                         <svg class="w-5 h-5 mr-3 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
                         Upload PRs & AI
                     </a>

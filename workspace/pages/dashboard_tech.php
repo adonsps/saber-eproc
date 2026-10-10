@@ -318,6 +318,33 @@ try {
 } catch (PDOException $e) {}
 ?>
 
+<?php if (!empty($_SESSION['flash_pr_success'])): 
+    $fps = $_SESSION['flash_pr_success'];
+    unset($_SESSION['flash_pr_success']);
+?>
+<div class="mb-6 p-4 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-900 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4">
+    <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-xl bg-emerald-600 text-white flex items-center justify-center flex-shrink-0 shadow-sm">
+            <i class="fas fa-check text-lg"></i>
+        </div>
+        <div>
+            <h4 class="font-extrabold text-sm text-emerald-950">Purchase Requisition Berhasil Dibuat!</h4>
+            <p class="text-xs text-emerald-800 mt-0.5">
+                Ticket <strong class="font-mono bg-white/70 px-1.5 py-0.5 rounded border border-emerald-200"><?= htmlspecialchars($fps['ticket_no']) ?></strong> dengan <strong><?= (int)$fps['lines_count'] ?></strong> baris barang/jasa berhasil disimpan ke dalam sistem eProc.
+                <?php if (!empty($fps['assigned_pic']) && $fps['assigned_pic'] !== 'Unassigned'): ?>
+                Diarahkan ke PIC Sourcing: <strong class="text-blue-900"><?= htmlspecialchars($fps['assigned_pic']) ?></strong>.
+                <?php endif; ?>
+            </p>
+        </div>
+    </div>
+    <div class="flex items-center gap-2 self-end md:self-auto">
+        <button type="button" onclick="openTicketDetailModal('<?= htmlspecialchars($fps['ticket_no']) ?>')" class="px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg text-xs font-bold transition flex items-center gap-1.5 flex-shrink-0 shadow-sm">
+            <i class="fas fa-eye text-[11px]"></i> Lihat Detail PR
+        </button>
+    </div>
+</div>
+<?php endif; ?>
+
 <div class="mb-6 flex flex-col md:flex-row md:justify-between md:items-end gap-4 border-b pb-4">
     <div>
         <h2 class="text-2xl font-bold text-gray-800">My Worklist</h2>
@@ -331,6 +358,12 @@ try {
         </div>
         <?php endif; ?>
         <span class="bg-indigo-100 text-indigo-800 px-4 py-2 rounded-lg font-bold shadow-sm border border-indigo-200">Total: <?= count($assigned_prs) ?></span>
+        
+        <!-- Create PR Button for Technical Department -->
+        <a href="pr_create.php" class="px-4 py-2 bg-blue-700 hover:bg-blue-800 text-white text-xs md:text-sm font-bold rounded-lg shadow-sm hover:shadow-md transform hover:-translate-y-0.5 transition-all duration-150 focus:outline-none flex items-center gap-1.5">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg>
+            + Create PR Direct
+        </a>
     </div>
 </div>
 
@@ -658,7 +691,11 @@ try {
                 <?php foreach ($assigned_prs as $pr): ?>
                     <tr class="hover:bg-indigo-50 transition border-b border-gray-100" data-assigned-by-ai="<?= (int)$pr['assigned_by_ai'] ?>" data-ticket-type="<?= htmlspecialchars($pr['ticket_type'] ?? '') ?>">
                         <td class="px-4 py-3 text-sm font-medium text-gray-900" data-order="<?= $pr['pr_date'] ? date('Y-m-d', strtotime($pr['pr_date'])) : '' ?>" data-ticket="<?= htmlspecialchars($pr['ticket_no']) ?>">
-                            <?= htmlspecialchars($pr['ticket_no']) ?>
+                            <a href="javascript:void(0)" onclick="openTicketDetailModal('<?= htmlspecialchars($pr['ticket_no']) ?>')" 
+                               class="text-blue-700 hover:text-blue-900 font-bold hover:underline transition inline-flex items-center gap-1 group">
+                                <span><?= htmlspecialchars($pr['ticket_no']) ?></span>
+                                <i class="fas fa-external-link-alt text-[9px] text-slate-400 group-hover:text-blue-700 opacity-60"></i>
+                            </a>
                             <?php if ($pr['pr_date']): ?>
                             <div class="text-[10px] text-gray-400 mt-0.5"><?= date('d M Y', strtotime($pr['pr_date'])) ?></div>
                             <?php endif; ?>
@@ -1428,7 +1465,77 @@ $(document).ready(function() {
     });
 
 });
-</script>
+<!-- Ticket Detail Modal -->
+<div id="ticketDetailModal" class="hidden fixed inset-0 z-50 overflow-y-auto" aria-labelledby="modal-title" role="dialog" aria-modal="true">
+    <div class="flex items-center justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
+        <!-- Background overlay with blur -->
+        <div class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm transition-opacity" onclick="closeTicketDetailModal()"></div>
 
+        <!-- Center trick -->
+        <span class="hidden sm:inline-block sm:align-middle sm:h-screen" aria-hidden="true">&#8203;</span>
+
+        <div class="inline-block align-bottom bg-white rounded-2xl text-left overflow-hidden shadow-2xl transform transition-all sm:my-8 sm:align-middle sm:max-w-4xl sm:w-full border border-slate-200">
+            <!-- Modal Header -->
+            <div class="px-6 py-4 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
+                <div class="flex items-center gap-2.5">
+                    <span class="w-8 h-8 rounded-lg bg-blue-100 text-blue-700 flex items-center justify-center text-sm font-bold">
+                        <i class="fas fa-file-invoice"></i>
+                    </span>
+                    <div>
+                        <h3 class="text-base font-bold text-slate-900 leading-none" id="ticketModalTitle">Detail Requisition (PR)</h3>
+                        <span class="text-xs text-slate-400 mt-1 block">Rincian pengadaan dan seluruh baris kebutuhan</span>
+                    </div>
+                </div>
+                <button type="button" onclick="closeTicketDetailModal()" class="w-8 h-8 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-200/60 flex items-center justify-center transition">
+                    <i class="fas fa-times text-sm"></i>
+                </button>
+            </div>
+
+            <!-- Modal Content Body -->
+            <div id="ticketModalBody" class="p-6 max-h-[75vh] overflow-y-auto">
+                <!-- Content injected via AJAX -->
+            </div>
+
+            <!-- Modal Footer -->
+            <div class="px-6 py-3 bg-slate-50 border-t border-slate-200 flex justify-end">
+                <button type="button" onclick="closeTicketDetailModal()" class="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold rounded-xl text-xs transition">
+                    Tutup
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+function openTicketDetailModal(ticketNo) {
+    if (!ticketNo) return;
+    $('#ticketModalTitle').text('Detail Requisition: ' + ticketNo);
+    $('#ticketModalBody').html(`
+        <div class="py-12 text-center text-slate-400">
+            <i class="fas fa-spinner fa-spin text-3xl text-blue-600 mb-3 block"></i>
+            <span class="text-sm font-medium">Memuat rincian PR...</span>
+        </div>
+    `);
+    $('#ticketDetailModal').removeClass('hidden');
+    $('body').addClass('overflow-hidden');
+
+    $.get('ajax_pr_ticket_detail.php', { ticket_no: ticketNo }, function(html) {
+        $('#ticketModalBody').html(html);
+    }).fail(function() {
+        $('#ticketModalBody').html('<div class="p-6 text-center text-rose-600 font-bold">Gagal memuat detail tiket.</div>');
+    });
+}
+
+function closeTicketDetailModal() {
+    $('#ticketDetailModal').addClass('hidden');
+    $('body').removeClass('overflow-hidden');
+}
+
+$(document).keydown(function(e) {
+    if (e.key === "Escape" && !$('#ticketDetailModal').hasClass('hidden')) {
+        closeTicketDetailModal();
+    }
+});
+</script>
 
 <?php require_once '../includes/footer.php'; ?>
