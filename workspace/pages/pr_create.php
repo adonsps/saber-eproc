@@ -134,17 +134,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         $errors[] = 'Minimal harus menambahkan 1 (satu) baris barang atau jasa pada PR.';
     } else {
         foreach ($raw_items as $idx => $row) {
-            $desc  = trim($row['description'] ?? '');
-            $qty   = (float)($row['qty'] ?? 0);
-            $uom   = strtoupper(trim($row['uom'] ?? 'PCS'));
-            $price = (float)($row['baseline_price'] ?? 0);
-            $sku   = trim($row['sku'] ?? '');
-            $qlink = trim($row['quotation_link'] ?? '');
+            $desc      = trim($row['description'] ?? '');
+            $qty       = (float)($row['qty'] ?? 0);
+            $uom       = strtoupper(trim($row['uom'] ?? 'PCS'));
+            $price     = (float)($row['baseline_price'] ?? 0);
+            $item_type = trim($row['item_type'] ?? 'catalogue');
+            $sku       = trim($row['sku'] ?? '');
+            $qlink     = trim($row['quotation_link'] ?? '');
             $item_deliv = trim($row['delivery_date'] ?? $delivery_date);
 
             // Skip empty rows if multiple rows exist
             if ($desc === '' && $qty <= 0 && count($raw_items) > 1) {
                 continue;
+            }
+
+            if ($item_type === 'new_item' && ($sku === '' || $sku === 'NEW-ITEM')) {
+                $sku = 'NEW-ITEM';
             }
 
             if ($desc === '') {
@@ -160,6 +165,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                 'uom'            => $uom ?: 'PCS',
                 'baseline_price' => $price >= 0 ? $price : 0,
                 'sku'            => $sku,
+                'item_type'      => $item_type,
                 'quotation_link' => $qlink,
                 'delivery_date'  => $item_deliv ?: null,
             ];
@@ -472,19 +478,25 @@ require_once '../includes/header.php';
 
     <!-- Card 2: Line Items Barang / Jasa -->
     <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-        <div class="px-6 py-4 bg-slate-50/70 border-b border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-3">
+        <div class="px-6 py-4 bg-slate-50/70 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div class="flex items-center gap-2.5">
                 <span class="w-7 h-7 rounded-lg bg-blue-50 text-blue-700 flex items-center justify-center text-xs font-bold border border-blue-100">2</span>
                 <div>
                     <h3 class="text-sm font-bold text-slate-800 uppercase tracking-wider">Daftar Barang / Jasa yang Dibutuhkan</h3>
-                    <p class="text-[11px] text-slate-500">Isi spesifikasi, perkiraan jumlah, dan estimasi harga untuk setiap item kebutuhan.</p>
+                    <p class="text-[11px] text-slate-500">Pilih dari Kamus SKU / Katalog Produk, atau ajukan Item Baru (Non-Katalog) untuk barang/jasa khusus.</p>
                 </div>
             </div>
 
-            <button type="button" id="btnAddLineItem" 
-                class="inline-flex items-center gap-2 px-4 py-2 bg-blue-700 hover:bg-blue-800 text-white text-xs font-bold rounded-xl shadow-sm hover:shadow transition">
-                <i class="fas fa-plus text-[10px]"></i> Tambah Baris Barang/Jasa
-            </button>
+            <div class="flex items-center flex-wrap gap-2">
+                <button type="button" id="btnOpenSkuModalHeader" 
+                    class="inline-flex items-center gap-1.5 px-3.5 py-2 bg-blue-700 hover:bg-blue-800 text-white text-xs font-bold rounded-xl shadow-sm hover:shadow transition">
+                    <i class="fas fa-search text-[10px]"></i> Cari dari SKU Dictionary
+                </button>
+                <button type="button" id="btnAddNewItemHeader" 
+                    class="inline-flex items-center gap-1.5 px-3.5 py-2 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 text-xs font-bold rounded-xl shadow-sm hover:shadow transition">
+                    <i class="fas fa-plus text-[10px]"></i> Request Item Baru (Non-Katalog)
+                </button>
+            </div>
         </div>
 
         <div class="overflow-x-auto">
@@ -492,11 +504,11 @@ require_once '../includes/header.php';
                 <thead>
                     <tr class="bg-slate-100/70 border-b border-slate-200 text-slate-600 font-bold uppercase text-[10px] tracking-wider">
                         <th class="py-3 px-3 w-12 text-center">Line</th>
-                        <th class="py-3 px-3 min-w-[280px]">Deskripsi Barang / Spesifikasi Teknis <span class="text-rose-500">*</span></th>
-                        <th class="py-3 px-3 w-32">SKU Code</th>
+                        <th class="py-3 px-3 min-w-[320px]">Deskripsi Barang / Jasa & Tipe <span class="text-rose-500">*</span></th>
+                        <th class="py-3 px-3 w-36">SKU Code</th>
                         <th class="py-3 px-3 w-28 text-right">Jumlah (Qty) <span class="text-rose-500">*</span></th>
                         <th class="py-3 px-3 w-28 text-center">Satuan (UoM) <span class="text-rose-500">*</span></th>
-                        <th class="py-3 px-3 w-36 text-right">Estimasi Harga Unit (IDR)</th>
+                        <th class="py-3 px-3 w-36 text-right">Estimasi Harga (IDR)</th>
                         <th class="py-3 px-3 w-36 text-right">Subtotal</th>
                         <th class="py-3 px-3 w-40">Dokumen / Quotation Link</th>
                         <th class="py-3 px-3 w-12 text-center">Aksi</th>
@@ -549,13 +561,101 @@ require_once '../includes/header.php';
 
 </form>
 
-<!-- JS Logic for Dynamic Line Items, Calculation, and Real-time PGroup / Ticket Validation -->
+<!-- Modal: Browse & Search SKU Dictionary -->
+<div id="skuSearchModal" class="fixed inset-0 z-50 hidden overflow-y-auto" aria-labelledby="modal-title" role="dialog" aria-modal="true">
+    <!-- Backdrop with blur -->
+    <div class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm transition-opacity" id="skuModalBackdrop"></div>
+
+    <div class="flex min-h-screen items-center justify-center p-4 text-center sm:p-6">
+        <div class="relative transform overflow-hidden rounded-2xl bg-white text-left shadow-2xl transition-all sm:my-8 sm:w-full sm:max-w-3xl border border-slate-200 flex flex-col max-h-[88vh]">
+            
+            <!-- Modal Header -->
+            <div class="px-6 py-4 bg-slate-50 border-b border-slate-200 flex items-center justify-between flex-shrink-0">
+                <div class="flex items-center gap-3">
+                    <span class="w-10 h-10 rounded-xl bg-blue-100 text-blue-700 flex items-center justify-center text-lg border border-blue-200 shadow-sm">
+                        <i class="fas fa-book-open"></i>
+                    </span>
+                    <div>
+                        <h3 class="text-base font-bold text-slate-900 flex items-center gap-2">
+                            Kamus SKU & Katalog Produk
+                            <span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-50 text-blue-700 border border-blue-200">36.000+ Items</span>
+                        </h3>
+                        <p class="text-xs text-slate-500 mt-0.5">
+                            Cari dan pilih barang yang sudah terdaftar, atau ajukan sebagai item baru jika belum ada di katalog.
+                        </p>
+                    </div>
+                </div>
+                <button type="button" id="btnCloseSkuModal" class="p-2 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition">
+                    <i class="fas fa-times text-base"></i>
+                </button>
+            </div>
+
+            <!-- Search Bar & Controls -->
+            <div class="p-4 bg-white border-b border-slate-100 flex-shrink-0">
+                <div class="relative">
+                    <div class="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
+                        <i class="fas fa-search text-sm"></i>
+                    </div>
+                    <input type="text" id="skuSearchInput" 
+                        class="w-full pl-10 pr-24 py-2.5 bg-slate-50 border border-slate-300 rounded-xl text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-600 focus:bg-white transition" 
+                        placeholder="Ketik nama barang, deskripsi, atau nomor SKU (e.g. kursi, meja, kabel, toner, 31089)..."
+                        autocomplete="off">
+                    <button type="button" id="btnClearSkuSearch" class="absolute inset-y-0 right-2 px-2.5 my-1.5 text-xs text-slate-400 hover:text-slate-700 font-semibold rounded-lg hover:bg-slate-100 hidden">
+                        Clear
+                    </button>
+                </div>
+                <div class="flex items-center justify-between mt-2 px-1 text-[11px] text-slate-500">
+                    <span id="skuSearchStatus">Menampilkan item populer/terbaru...</span>
+                    <span class="text-slate-400">Klik "Pilih Item" untuk memasukkan ke baris PR</span>
+                </div>
+            </div>
+
+            <!-- Results List / Scroll Area -->
+            <div class="flex-1 overflow-y-auto p-4 space-y-2.5 bg-slate-50/50 min-h-[260px]" id="skuSearchResultsContainer">
+                <!-- Live search items will be rendered here -->
+            </div>
+
+            <!-- Modal Footer: Call To Action for New Item Request -->
+            <div class="p-4 bg-amber-50/80 border-t border-amber-200/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3 flex-shrink-0">
+                <div class="flex items-start gap-2.5">
+                    <div class="w-7 h-7 rounded-lg bg-amber-100 text-amber-800 flex items-center justify-center text-xs font-bold flex-shrink-0 mt-0.5 border border-amber-200">
+                        <i class="fas fa-sparkles"></i>
+                    </div>
+                    <div>
+                        <div class="text-xs font-bold text-amber-900">Barang tidak ditemukan di katalog / SKU dictionary?</div>
+                        <div class="text-[11px] text-amber-800/80">Anda dapat langsung mengajukan permintaan sebagai barang baru (non-katalog).</div>
+                    </div>
+                </div>
+                <button type="button" id="btnRequestNewItemFromModal" 
+                    class="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded-xl text-xs shadow-sm hover:shadow transition flex items-center justify-center gap-1.5 flex-shrink-0">
+                    <i class="fas fa-plus-circle text-xs"></i> Request Item Baru (Non-Katalog)
+                </button>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+<!-- JS Logic for Dynamic Line Items, Calculation, and SKU Search / New Item Modal -->
 <script>
 const pgroupMap   = <?= json_encode($pgroup_map, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP) ?>;
 const uomOptions  = <?= json_encode($uom_options, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP) ?>;
 const oldItems    = <?= json_encode($_POST['items'] ?? [], JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP) ?>;
 
 let rowCounter = 0;
+let activeModalTargetRowId = null;
+let skuSearchXhr = null;
+let skuSearchDebounce = null;
+
+function escapeHtml(text) {
+    if (text === null || text === undefined) return '';
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
 
 function formatRupiah(number) {
     return 'Rp ' + Number(number).toLocaleString('id-ID', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
@@ -587,14 +687,17 @@ function addLineItemRow(data = {}) {
     rowCounter++;
     const idx = rowCounter;
 
+    const itemType = (data.item_type === 'new_item' || data.sku === 'NEW-ITEM') ? 'new_item' : 'catalogue';
+    const isNewItem = (itemType === 'new_item');
+
     const desc  = data.description || '';
     const qty   = data.qty || '';
     const uom   = (data.uom || 'PCS').toUpperCase();
     const price = data.baseline_price || '';
-    const sku   = data.sku || '';
+    const skuVal = isNewItem ? (data.sku || 'NEW-ITEM') : (data.sku || '');
     const qlink = data.quotation_link || '';
 
-    let uomSelectHtml = `<select name="items[${idx}][uom]" class="w-full px-2 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-semibold text-slate-800 focus:outline-none focus:ring-1 focus:ring-blue-600 text-center">`;
+    let uomSelectHtml = `<select name="items[${idx}][uom]" class="select-uom w-full px-2 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-semibold text-slate-800 focus:outline-none focus:ring-1 focus:ring-blue-600 text-center">`;
     uomOptions.forEach(opt => {
         const sel = (opt === uom) ? 'selected' : '';
         uomSelectHtml += `<option value="${opt}" ${sel}>${opt}</option>`;
@@ -603,41 +706,73 @@ function addLineItemRow(data = {}) {
 
     const trHtml = `
     <tr class="item-row hover:bg-slate-50/70 transition" data-row-id="${idx}">
-        <td class="py-3 px-3 text-center">
+        <td class="py-3 px-3 text-center align-top pt-4">
             <span class="line-idx-badge px-2 py-1 rounded-md bg-slate-100 font-mono text-[11px] font-bold text-slate-700 border border-slate-200">10</span>
         </td>
-        <td class="py-3 px-3">
+        <td class="py-3 px-3 align-top">
+            <!-- Row Type Badge and Switching Controls -->
+            <div class="flex items-center justify-between mb-1.5 flex-wrap gap-1">
+                <div class="item-type-badge-container">
+                    ${isNewItem ? `
+                        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-50 text-amber-800 border border-amber-200">
+                            <i class="fas fa-sparkles text-[9px] text-amber-600"></i> Item Baru (Non-Katalog)
+                        </span>
+                    ` : `
+                        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-blue-50 text-blue-700 border border-blue-200">
+                            <i class="fas fa-barcode text-[9px]"></i> Katalog SKU
+                        </span>
+                    `}
+                </div>
+                <div class="flex items-center gap-2 text-[11px]">
+                    <button type="button" class="btn-row-pick-sku text-blue-600 hover:text-blue-800 font-bold inline-flex items-center gap-1 transition" title="Cari di Kamus SKU">
+                        <i class="fas fa-search text-[10px]"></i> <span class="btn-search-text">${isNewItem ? 'Cari di SKU' : 'Ganti SKU'}</span>
+                    </button>
+                    <span class="text-slate-300">|</span>
+                    <button type="button" class="btn-row-toggle-type text-slate-500 hover:text-slate-800 font-medium transition" title="Ganti tipe pengadaan item ini">
+                        <span class="btn-toggle-text">${isNewItem ? 'Jadikan Katalog' : 'Ubah ke Item Baru'}</span>
+                    </button>
+                </div>
+            </div>
+            
+            <input type="hidden" name="items[${idx}][item_type]" class="input-item-type" value="${itemType}">
+
             <textarea name="items[${idx}][description]" required rows="2" 
-                class="w-full px-3 py-1.5 bg-white border border-slate-300 rounded-lg text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600 leading-normal" 
-                placeholder="Rincian barang/jasa, merek, spesifikasi, atau lingkup kerja...">${$('<div/>').text(desc).html()}</textarea>
+                class="input-description w-full px-3 py-1.5 bg-white border border-slate-300 rounded-lg text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600 leading-normal" 
+                placeholder="${isNewItem ? 'Tuliskan nama barang/jasa baru, merek, spesifikasi teknis, atau ruang lingkup pekerjaan...' : 'Deskripsi barang/spesifikasi dari katalog SKU...'}">${$('<div/>').text(desc).html()}</textarea>
         </td>
-        <td class="py-3 px-3">
-            <input type="text" name="items[${idx}][sku]" value="${$('<div/>').text(sku).html()}" 
-                class="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-mono text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-600" 
-                placeholder="e.g. 10425283">
+        <td class="py-3 px-3 align-top">
+            <div class="sku-input-wrapper">
+                <input type="text" name="items[${idx}][sku]" value="${$('<div/>').text(skuVal).html()}" 
+                    class="input-sku w-full px-2.5 py-1.5 border rounded-lg text-xs font-mono font-bold focus:outline-none focus:ring-1 ${isNewItem ? 'bg-amber-50/50 border-amber-200 text-amber-900 focus:ring-amber-500' : 'bg-slate-50 border-slate-300 text-slate-800 focus:ring-blue-600'}" 
+                    placeholder="${isNewItem ? 'NEW-ITEM' : 'e.g. 10425283'}"
+                    ${!isNewItem ? 'readonly' : ''}>
+                <div class="sku-hint text-[10px] mt-0.5 font-medium ${isNewItem ? 'text-amber-700' : 'text-slate-400'}">
+                    ${isNewItem ? 'Non-Katalog' : 'Terkoneksi Master'}
+                </div>
+            </div>
         </td>
-        <td class="py-3 px-3">
+        <td class="py-3 px-3 align-top">
             <input type="number" step="0.01" min="0.01" name="items[${idx}][qty]" value="${qty}" required 
                 class="input-qty w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-bold text-right text-slate-900 focus:outline-none focus:ring-1 focus:ring-blue-600" 
                 placeholder="1">
         </td>
-        <td class="py-3 px-3 text-center">
+        <td class="py-3 px-3 text-center align-top">
             ${uomSelectHtml}
         </td>
-        <td class="py-3 px-3">
+        <td class="py-3 px-3 align-top">
             <input type="number" step="100" min="0" name="items[${idx}][baseline_price]" value="${price}" 
                 class="input-price w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs text-right text-slate-800 focus:outline-none focus:ring-1 focus:ring-blue-600 font-mono" 
                 placeholder="0">
         </td>
-        <td class="py-3 px-3 text-right">
+        <td class="py-3 px-3 text-right align-top pt-4">
             <span class="line-subtotal font-bold text-blue-900 text-xs">Rp 0</span>
         </td>
-        <td class="py-3 px-3">
+        <td class="py-3 px-3 align-top">
             <input type="url" name="items[${idx}][quotation_link]" value="${$('<div/>').text(qlink).html()}" 
                 class="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-[11px] text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-600" 
                 placeholder="https://drive.google.com/...">
         </td>
-        <td class="py-3 px-3 text-center">
+        <td class="py-3 px-3 text-center align-top pt-3">
             <button type="button" class="btn-remove-row text-slate-400 hover:text-rose-600 p-1.5 rounded-lg hover:bg-rose-50 transition" title="Hapus Baris">
                 <i class="fas fa-trash-alt text-xs"></i>
             </button>
@@ -648,6 +783,214 @@ function addLineItemRow(data = {}) {
     updateTotals();
 }
 
+// Apply selected SKU details to a row
+function applySkuToRow(rowId, item) {
+    const row = $(`#lineItemsBody tr[data-row-id="${rowId}"]`);
+    if (row.length === 0) return;
+
+    row.find('.input-item-type').val('catalogue');
+    row.find('.input-description').val(item.detail);
+    row.find('.input-description').attr('placeholder', 'Deskripsi barang/spesifikasi dari katalog SKU...');
+    
+    row.find('.input-sku').val(item.sku).prop('readonly', true)
+        .removeClass('bg-amber-50/50 border-amber-200 text-amber-900')
+        .addClass('bg-slate-50 border-slate-300 text-slate-800');
+    row.find('.sku-hint').text('Terkoneksi Master')
+        .removeClass('text-amber-700').addClass('text-slate-400');
+    
+    // Update badge & button texts
+    row.find('.item-type-badge-container').html(`
+        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-blue-50 text-blue-700 border border-blue-200">
+            <i class="fas fa-barcode text-[9px]"></i> Katalog SKU
+        </span>
+    `);
+    row.find('.btn-row-pick-sku .btn-search-text').text('Ganti SKU');
+    row.find('.btn-row-toggle-type .btn-toggle-text').text('Ubah ke Item Baru');
+
+    // Update UoM if matches options
+    if (item.uom) {
+        row.find('.select-uom').val(item.uom.toUpperCase());
+    }
+
+    // Update price if available
+    if (parseFloat(item.price) > 0) {
+        row.find('.input-price').val(item.price);
+    }
+
+    // Focus on Qty input
+    row.find('.input-qty').focus();
+    updateTotals();
+}
+
+// Convert row to New Item Request (Non-Catalogue)
+function applyNewItemToRow(rowId, customDesc = '') {
+    const row = $(`#lineItemsBody tr[data-row-id="${rowId}"]`);
+    if (row.length === 0) return;
+
+    row.find('.input-item-type').val('new_item');
+    if (customDesc) {
+        row.find('.input-description').val(customDesc);
+    }
+    row.find('.input-description').attr('placeholder', 'Tuliskan nama barang/jasa baru, merek, spesifikasi teknis, atau ruang lingkup pekerjaan...');
+
+    row.find('.input-sku').val('NEW-ITEM').prop('readonly', false)
+        .removeClass('bg-slate-50 border-slate-300 text-slate-800')
+        .addClass('bg-amber-50/50 border-amber-200 text-amber-900 focus:ring-amber-500');
+    row.find('.sku-hint').text('Non-Katalog')
+        .removeClass('text-slate-400').addClass('text-amber-700');
+
+    // Update badge & button texts
+    row.find('.item-type-badge-container').html(`
+        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-50 text-amber-800 border border-amber-200">
+            <i class="fas fa-sparkles text-[9px] text-amber-600"></i> Item Baru (Non-Katalog)
+        </span>
+    `);
+    row.find('.btn-row-pick-sku .btn-search-text').text('Cari di SKU');
+    row.find('.btn-row-toggle-type .btn-toggle-text').text('Jadikan Katalog');
+
+    if (!customDesc) {
+        row.find('.input-description').focus();
+    } else {
+        row.find('.input-qty').focus();
+    }
+
+    updateTotals();
+}
+
+// Open SKU Search Modal
+function openSkuModal(targetRowId = null) {
+    activeModalTargetRowId = targetRowId;
+    $('#skuSearchModal').removeClass('hidden');
+
+    let initialQuery = '';
+    if (targetRowId) {
+        const row = $(`#lineItemsBody tr[data-row-id="${targetRowId}"]`);
+        const desc = row.find('.input-description').val().trim();
+        if (desc && desc.length < 40) {
+            initialQuery = desc;
+        }
+    }
+
+    $('#skuSearchInput').val(initialQuery);
+    loadSkuItems(initialQuery);
+    setTimeout(() => $('#skuSearchInput').focus().select(), 100);
+}
+
+// Close SKU Search Modal
+function closeSkuModal() {
+    $('#skuSearchModal').addClass('hidden');
+    activeModalTargetRowId = null;
+    if (skuSearchXhr) {
+        skuSearchXhr.abort();
+    }
+}
+
+// Load SKU Items via AJAX
+function loadSkuItems(query) {
+    query = (query || '').trim();
+    $('#skuSearchStatus').html('<span class="text-blue-700 font-semibold"><i class="fas fa-spinner fa-spin mr-1"></i> Memuat katalog SKU...</span>');
+    $('#btnClearSkuSearch').toggleClass('hidden', query === '');
+
+    if (skuSearchXhr) {
+        skuSearchXhr.abort();
+    }
+
+    skuSearchXhr = $.getJSON('ajax_sku_search.php', { q: query, limit: 30 }, function(res) {
+        if (res.status === 'success') {
+            renderSkuResults(res.results, query);
+        } else {
+            $('#skuSearchResultsContainer').html('<div class="p-6 text-center text-rose-600 text-xs font-semibold">Gagal memuat katalog: ' + escapeHtml(res.message) + '</div>');
+        }
+    }).fail(function(jqXHR, textStatus) {
+        if (textStatus === 'abort') return;
+        $('#skuSearchResultsContainer').html('<div class="p-6 text-center text-rose-600 text-xs font-semibold">Terjadi kendala jaringan saat menghubungi katalog SKU.</div>');
+    });
+}
+
+// Render Results inside Modal
+function renderSkuResults(items, query) {
+    const container = $('#skuSearchResultsContainer');
+    container.empty();
+
+    if (!items || items.length === 0) {
+        $('#skuSearchStatus').text('0 item ditemukan');
+        const emptyHtml = `
+            <div class="text-center py-10 px-4 bg-white rounded-xl border border-dashed border-slate-200">
+                <div class="w-12 h-12 mx-auto rounded-full bg-amber-50 text-amber-600 flex items-center justify-center text-lg mb-3 border border-amber-200">
+                    <i class="fas fa-search"></i>
+                </div>
+                <h4 class="text-sm font-bold text-slate-800 mb-1">Item Tidak Ditemukan di SKU Dictionary</h4>
+                <p class="text-xs text-slate-500 max-w-md mx-auto mb-4">
+                    Tidak ditemukan katalog untuk "${escapeHtml(query)}". Anda dapat langsung mengajukan permintaan sebagai <strong>Item Baru (Non-Katalog)</strong>.
+                </p>
+                <button type="button" class="btn-create-new-from-query px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-xl shadow-sm inline-flex items-center gap-1.5 transition">
+                    <i class="fas fa-plus text-[10px]"></i> Ajukan "${escapeHtml(query)}" Sebagai Item Baru
+                </button>
+            </div>
+        `;
+        container.html(emptyHtml);
+        return;
+    }
+
+    $('#skuSearchStatus').text(items.length + (query ? ' item ditemukan untuk "' + query + '"' : ' item terdaftar'));
+
+    items.forEach(function(item) {
+        const catBadge = item.category && item.category !== 'General' 
+            ? `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-100 text-slate-600 border border-slate-200">${escapeHtml(item.category)}</span>` 
+            : '';
+
+        const card = `
+            <div class="sku-result-item bg-white p-3.5 rounded-xl border border-slate-200 hover:border-blue-400 hover:shadow-sm transition flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div class="space-y-1 flex-1">
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <span class="px-2 py-0.5 rounded text-[11px] font-mono font-bold bg-blue-50 text-blue-700 border border-blue-200">
+                            SKU: ${escapeHtml(item.sku)}
+                        </span>
+                        ${catBadge}
+                        <span class="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-700 border border-slate-200">
+                            UoM: ${escapeHtml(item.uom)}
+                        </span>
+                    </div>
+                    <h4 class="text-xs font-bold text-slate-900 leading-snug">
+                        ${escapeHtml(item.detail)}
+                    </h4>
+                    <div class="text-xs font-semibold text-emerald-700 flex items-center gap-1">
+                        <span class="text-slate-400 text-[11px] font-normal">Est. Harga Satuan:</span>
+                        <span>${escapeHtml(item.est_price_formatted)}</span>
+                    </div>
+                </div>
+                <div class="sm:flex-shrink-0">
+                    <button type="button" class="btn-select-sku-item w-full sm:w-auto px-4 py-2 bg-blue-700 hover:bg-blue-800 text-white text-xs font-bold rounded-xl shadow-sm transition flex items-center justify-center gap-1.5"
+                        data-sku="${escapeHtml(item.sku)}"
+                        data-detail="${escapeHtml(item.detail)}"
+                        data-uom="${escapeHtml(item.uom)}"
+                        data-price="${item.est_price}">
+                        <i class="fas fa-check text-[10px]"></i> Pilih Item
+                    </button>
+                </div>
+            </div>
+        `;
+        container.append(card);
+    });
+}
+
+// Request New Item From Modal Action
+function handleRequestNewItemFromModal() {
+    const query = $('#skuSearchInput').val().trim();
+
+    if (activeModalTargetRowId) {
+        applyNewItemToRow(activeModalTargetRowId, query);
+    } else {
+        addLineItemRow({
+            item_type: 'new_item',
+            sku: 'NEW-ITEM',
+            description: query
+        });
+    }
+
+    closeSkuModal();
+}
+
 $(document).ready(function() {
     // Populate items: either from POST validation return or single blank row
     if (oldItems && oldItems.length > 0) {
@@ -656,12 +999,38 @@ $(document).ready(function() {
         addLineItemRow();
     }
 
-    // Add item click
-    $('#btnAddLineItem').on('click', function() {
-        addLineItemRow();
+    // Header buttons
+    $('#btnOpenSkuModalHeader').on('click', function() {
+        openSkuModal(null);
     });
 
-    // Remove item click
+    $('#btnAddNewItemHeader').on('click', function() {
+        addLineItemRow({
+            item_type: 'new_item',
+            sku: 'NEW-ITEM',
+            description: ''
+        });
+    });
+
+    // Row-level buttons
+    $('#lineItemsBody').on('click', '.btn-row-pick-sku', function() {
+        const rowId = $(this).closest('tr').data('row-id');
+        openSkuModal(rowId);
+    });
+
+    $('#lineItemsBody').on('click', '.btn-row-toggle-type', function() {
+        const row = $(this).closest('tr');
+        const rowId = row.data('row-id');
+        const currentType = row.find('.input-item-type').val();
+
+        if (currentType === 'new_item') {
+            openSkuModal(rowId);
+        } else {
+            applyNewItemToRow(rowId);
+        }
+    });
+
+    // Remove row button
     $('#lineItemsBody').on('click', '.btn-remove-row', function() {
         if ($('#lineItemsBody tr').length <= 1) {
             alert('PR minimal harus memiliki 1 baris kebutuhan barang/jasa.');
@@ -675,6 +1044,53 @@ $(document).ready(function() {
     $('#lineItemsBody').on('input', '.input-qty, .input-price', function() {
         updateTotals();
     });
+
+    // Modal Events
+    $('#btnCloseSkuModal, #skuModalBackdrop').on('click', closeSkuModal);
+
+    $(document).on('keydown', function(e) {
+        if (e.key === 'Escape' && !$('#skuSearchModal').hasClass('hidden')) {
+            closeSkuModal();
+        }
+    });
+
+    $('#skuSearchInput').on('input', function() {
+        clearTimeout(skuSearchDebounce);
+        const val = $(this).val();
+        skuSearchDebounce = setTimeout(() => loadSkuItems(val), 220);
+    });
+
+    $('#btnClearSkuSearch').on('click', function() {
+        $('#skuSearchInput').val('').focus();
+        loadSkuItems('');
+    });
+
+    // Select SKU Item from Modal
+    $('#skuSearchResultsContainer').on('click', '.btn-select-sku-item', function() {
+        const sku    = $(this).data('sku');
+        const detail = $(this).data('detail');
+        const uom    = $(this).data('uom');
+        const price  = $(this).data('price');
+
+        const item = { sku, detail, uom, price };
+
+        if (activeModalTargetRowId) {
+            applySkuToRow(activeModalTargetRowId, item);
+        } else {
+            addLineItemRow({
+                item_type: 'catalogue',
+                sku: sku,
+                description: detail,
+                uom: uom,
+                baseline_price: price
+            });
+        }
+
+        closeSkuModal();
+    });
+
+    $('#btnRequestNewItemFromModal').on('click', handleRequestNewItemFromModal);
+    $('#skuSearchResultsContainer').on('click', '.btn-create-new-from-query', handleRequestNewItemFromModal);
 
     // PGroup live preview
     function updatePgroupPreview() {

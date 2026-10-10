@@ -362,7 +362,7 @@ try {
         <!-- Create PR Button for Technical Department -->
         <a href="pr_create.php" class="px-4 py-2 bg-blue-700 hover:bg-blue-800 text-white text-xs md:text-sm font-bold rounded-lg shadow-sm hover:shadow-md transform hover:-translate-y-0.5 transition-all duration-150 focus:outline-none flex items-center gap-1.5">
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg>
-            + Create PR Direct
+            Create PR Direct
         </a>
     </div>
 </div>

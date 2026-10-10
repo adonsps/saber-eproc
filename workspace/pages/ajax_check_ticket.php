@@ -1,9 +1,9 @@
 <?php
 // pages/ajax_check_ticket.php
 // Real-time check whether a ticket_no already exists in prs table.
-require_once '../includes/auth.php';
+require_once __DIR__ . '/../includes/auth.php';
 require_login();
-require_once '../config/database.php';
+require_once __DIR__ . '/../config/database.php';
 
 header('Content-Type: application/json');
 

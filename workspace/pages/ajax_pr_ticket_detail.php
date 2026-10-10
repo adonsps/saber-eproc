@@ -1,10 +1,10 @@
 <?php
 // pages/ajax_pr_ticket_detail.php
 // Returns detailed PR info and line items for a given ticket_no.
-require_once '../includes/auth.php';
+require_once __DIR__ . '/../includes/auth.php';
 require_login();
-require_once '../config/database.php';
-require_once '../includes/pr_status_helper.php';
+require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/../includes/pr_status_helper.php';
 
 $ticket_no = trim($_GET['ticket_no'] ?? '');
 
@@ -139,8 +139,16 @@ try {
                             <td class="py-3 px-3">
                                 <div class="font-semibold text-slate-900 leading-snug"><?= nl2br(htmlspecialchars($item['item_description'])) ?></div>
                             </td>
-                            <td class="py-3 px-3 text-slate-500 font-mono text-[11px]">
-                                <?= htmlspecialchars($item['sku'] ?: '--') ?>
+                            <td class="py-3 px-3 text-left">
+                                <?php if (empty($item['sku']) || $item['sku'] === 'NEW-ITEM'): ?>
+                                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-50 text-amber-800 border border-amber-200 whitespace-nowrap">
+                                    <i class="fas fa-sparkles text-[9px] text-amber-600"></i> Item Baru
+                                </span>
+                                <?php else: ?>
+                                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-blue-50 text-blue-700 border border-blue-200 whitespace-nowrap">
+                                    <i class="fas fa-barcode text-[9px]"></i> <?= htmlspecialchars($item['sku']) ?>
+                                </span>
+                                <?php endif; ?>
                             </td>
                             <td class="py-3 px-3 text-right font-bold text-slate-800">
                                 <?= number_format((float)($item['qty'] ?? 0), 2, ',', '.') ?>
